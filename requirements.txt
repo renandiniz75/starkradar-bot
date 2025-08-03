@@ -1,7 +1,5 @@
 python-telegram-bot[webhooks]==20.3
 httpx==0.24.1
-pydantic==2.7.4
 aiohttp==3.9.5
 pandas==2.2.2
-numpy==2.0.1
-ta==0.11.0
+numpy==1.26.4
