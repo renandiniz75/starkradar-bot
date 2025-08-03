@@ -1,9 +1,16 @@
-# Telegram
+# Bot e rede
 python-telegram-bot[webhooks]==20.3
 httpx==0.24.1
 
-# Core de análise (com wheels para Linux/Py3.11)
-numpy==1.26.4
+# Ciência de dados (com fallback por versão de Python)
 pandas==2.2.2
+
+# Para Python < 3.12 (3.11, nosso alvo aqui)
+numpy==1.26.4 ; python_version < "3.12"
+
+# Para Python >= 3.12 (só se no futuro mudar)
+numpy>=2.2.2 ; python_version >= "3.12"
+
+# Indicadores e mercado
 yfinance==0.2.40
 ta==0.11.0
