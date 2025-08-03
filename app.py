@@ -4,232 +4,206 @@ import logging
 from datetime import datetime, timezone
 
 import aiohttp
+from aiohttp import web
 import pandas as pd
 import numpy as np
-from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+# ---------------------------------------------------------
+# Configuração básica
+# ---------------------------------------------------------
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
+logger = logging.getLogger("starkradar")
 
-# ---------------------------------------
-# Config
-# ---------------------------------------
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+
+# Porta para Render (Render injeta PORT). Local default=10000.
 PORT = int(os.getenv("PORT", "10000"))
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render injeta essa URL
+
+# Base pública do webhook:
+# 1) Preferimos RENDER_EXTERNAL_URL (fornecida pelo Render)
+# 2) Se não existir, tentamos WEBHOOK_BASE (variável manual)
+# 3) Opcionalmente, você pode trocar pelo domínio do Render fixo.
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL") or os.getenv("WEBHOOK_BASE") or ""
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else None
+if not BASE_URL:
+    # fallback; substitua pela sua URL de serviço se quiser fixar
+    BASE_URL = "https://starkradar-bot.onrender.com"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("stark-bot")
+# ---------------------------------------------------------
+# Funções auxiliares: EMA e RSI sem 'ta'
+# ---------------------------------------------------------
+def ema(series: pd.Series, window: int) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
 
+def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=series.index).ewm(span=window, adjust=False).mean()
+    roll_down = pd.Series(down, index=series.index).ewm(span=window, adjust=False).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    return 100.0 - (100.0 / (1.0 + rs))
 
-# ---------------------------------------
-# Utils: fetch de dados e análise
-# ---------------------------------------
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
+# ---------------------------------------------------------
+# Coleta de OHLC da Bybit (categoria linear, par *USDT)
+# ---------------------------------------------------------
+async def fetch_ohlc(symbol: str, interval: str = "60", limit: int = 300) -> pd.DataFrame:
+    """
+    symbol: 'ETH' ou 'BTC'
+    interval: '60' (1h), '15' (15m), '240' (4h)
+    """
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": f"{symbol}USDT",
+        "interval": interval,
+        "limit": str(limit),
+    }
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.get(url, params=params) as resp:
+            data = await resp.json()
+            if data.get("retCode") != 0:
+                raise RuntimeError(f"Bybit error: {data}")
+            rows = data["result"]["list"]  # mais recente primeiro
+            rows = list(reversed(rows))    # invertendo para cronológico
+            # [start, open, high, low, close, volume, turnover]
+            df = pd.DataFrame(
+                rows,
+                columns=["start", "open", "high", "low", "close", "volume", "turnover"],
+            )
+            df["time"] = pd.to_datetime(df["start"].astype("int64"), unit="ms", utc=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = df[col].astype(float)
+            return df
 
-async def fetch_klines(symbol: str, interval: str = "1h", limit: int = 500) -> pd.DataFrame:
-    url = BINANCE_KLINES.format(symbol=symbol, interval=interval, limit=limit)
-    async with aiohttp.ClientSession() as sess:
-        async with sess.get(url, timeout=20) as r:
-            r.raise_for_status()
-            data = await r.json()
+# ---------------------------------------------------------
+# Identificação de suportes e resistências (pivôs simples)
+# ---------------------------------------------------------
+def get_levels(close: pd.Series, window: int = 12, n_each: int = 3):
+    """
+    Usa janelas móveis centradas para localizar mínimas/máximas locais.
+    Retorna até n_each suportes e resistências próximos.
+    """
+    min_roll = close.rolling(window, center=True).min()
+    max_roll = close.rolling(window, center=True).max()
 
-    cols = [
-        "open_time","open","high","low","close","volume",
-        "close_time","qav","trades","taker_base","taker_quote","ignore"
-    ]
-    df = pd.DataFrame(data, columns=cols)
-    for c in ["open","high","low","close","volume"]:
-        df[c] = df[c].astype(float)
+    support_points = close[(close == min_roll)].dropna()
+    resist_points  = close[(close == max_roll)].dropna()
 
-    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
-    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
-    return df
+    supports = sorted(support_points.tail(10).values)[:n_each]
+    resistances = sorted(resist_points.tail(10).values, reverse=True)[:n_each]
+    return supports, resistances
 
+# ---------------------------------------------------------
+# Análise consolidada
+# ---------------------------------------------------------
+async def analyze_symbol(symbol: str) -> str:
+    """
+    Retorna um texto final da análise (1h) para ETH ou BTC.
+    """
+    try:
+        df = await fetch_ohlc(symbol, interval="60", limit=400)
+    except Exception as e:
+        logger.exception("Erro ao buscar OHLC: %s", e)
+        return f"❌ {symbol}: falha ao obter dados ({e})."
 
-def analyze_symbol(df: pd.DataFrame, tf_label: str) -> dict:
-    """Retorna métricas e níveis para compor a mensagem."""
+    if len(df) < 60:
+        return f"⚠️ {symbol}: dados insuficientes para análise."
+
     close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    vol = df["volume"]
+    price = float(close.iloc[-1])
+    ts = df["time"].iloc[-1].strftime("%Y-%m-%d %H:%M UTC")
+
+    # Variação 24h (24 candles de 1h)
+    try:
+        change_24h = (price / float(close.iloc[-24]) - 1.0) * 100.0
+    except Exception:
+        change_24h = np.nan
 
     # Indicadores
-    rsi_val = float(RSIIndicator(close, window=14).rsi().iloc[-1])
-    ema20 = float(EMAIndicator(close, window=20).ema_indicator().iloc[-1])
-    ema50 = float(EMAIndicator(close, window=50).ema_indicator().iloc[-1])
-    price = float(close.iloc[-1])
+    rsi14 = float(rsi(close, 14).iloc[-1])
+    ema20 = float(ema(close, 20).iloc[-1])
+    ema50 = float(ema(close, 50).iloc[-1])
+    trend = "tendência de alta" if ema20 > ema50 else "tendência de baixa"
 
-    # Tendência simples
-    trend = "⬆️ alta" if ema20 > ema50 else "⬇️ baixa"
+    # Suportes e resistências
+    supports, resistances = get_levels(close, window=14, n_each=3)
 
-    # Suportes/resistências simples (últimos 120 candles)
-    lookback = min(120, len(df))
-    z = df.tail(lookback)
-    s1 = float(z["low"].quantile(0.10))
-    s2 = float(z["low"].min())
-    r1 = float(z["high"].quantile(0.90))
-    r2 = float(z["high"].max())
-
-    # Formatação
-    def f(x): 
-        return f"{x:,.2f}".replace(",", "X").replace(".", ",").replace("X",".")
-
-    # Interpretação do RSI
-    if rsi_val < 30:
-        rsi_msg = "sobrevendido (potencial repique / compra na fraqueza)"
-    elif rsi_val < 40:
-        rsi_msg = "fraco (ainda vendedor, mas perto de região de possível defesa)"
-    elif rsi_val > 70:
-        rsi_msg = "sobrecomprado (risco de realização / reduzir risco)"
-    elif rsi_val > 60:
-        rsi_msg = "forte (tendência favorável, mas sem euforia)"
+    # Interpretação rápida do RSI
+    if rsi14 >= 70:
+        rsi_view = "sobrecomprado"
+    elif rsi14 <= 30:
+        rsi_view = "sobrevendido"
     else:
-        rsi_msg = "neutro"
+        rsi_view = "neutro"
 
-    return {
-        "tf": tf_label,
-        "price": f(price),
-        "rsi": f"{rsi_val:.1f}",
-        "rsi_msg": rsi_msg,
-        "ema20": f(ema20),
-        "ema50": f(ema50),
-        "trend": trend,
-        "s1": f(s1), "s2": f(s2),
-        "r1": f(r1), "r2": f(r2),
-        "vol": f(float(vol.tail(20).mean())),
-    }
+    sup_txt = ", ".join([f"${lvl:,.0f}" for lvl in supports]) if supports else "—"
+    res_txt = ", ".join([f"${lvl:,.0f}" for lvl in resistances]) if resistances else "—"
 
-
-def compose_message(symbol: str, h1: dict, m15: dict) -> str:
-    now = datetime.now(timezone.utc).strftime("%d/%m %H:%M UTC")
-    title = "📊 Análise {} — {}".format(
-        "Ethereum (ETH)" if symbol == "ETHUSDT" else "Bitcoin (BTC)", now
+    txt = (
+        f"📊 **{symbol}/USDT (1h)**\n"
+        f"• Preço: **${price:,.2f}**  |  24h: **{change_24h:+.2f}%**\n"
+        f"• RSI(14): **{rsi14:.1f}** ({rsi_view})\n"
+        f"• EMA20: **${ema20:,.2f}**  |  EMA50: **${ema50:,.2f}**  → **{trend}**\n"
+        f"• Suportes: {sup_txt}\n"
+        f"• Resistências: {res_txt}\n"
+        f"⏱ {ts}"
     )
+    return txt
 
-    def block(d: dict) -> str:
-        return (
-            f"• **{d['tf']}**\n"
-            f"  • Preço: **${d['price']}**\n"
-            f"  • RSI(14): **{d['rsi']}** → {d['rsi_msg']}\n"
-            f"  • EMA20/EMA50: **${d['ema20']} / ${d['ema50']}** → Tendência: {d['trend']}\n"
-            f"  • Vol. médio(20): **{d['vol']}**\n"
-            f"  • Suportes: **${d['s1']}** | **${d['s2']}**\n"
-            f"  • Resistências: **${d['r1']}** | **${d['r2']}**\n"
-        )
-
-    # Gatilhos operacionais simples
-    price = float(h1['price'].replace(".", "").replace(",", "."))  # reverter formatação
-    s1 = float(h1['s1'].replace(".", "").replace(",", "."))
-    r1 = float(h1['r1'].replace(".", "").replace(",", "."))
-    if price < s1:
-        call = "⚠️ Abaixo do suporte H1 — **evite aumentar risco**; considerar hedge/short tático."
-    elif price > r1:
-        call = "✅ Acima da 1ª resistência H1 — **tendência favorece compras** em recuos."
-    else:
-        call = "⏳ Zona intermediária — **esperar confirmação** (perda/recuperação de níveis)."
-
-    msg = (
-        f"{title}\n\n"
-        f"{block(h1)}"
-        f"{block(m15)}"
-        f"**Leitura rápida:** {call}\n"
-        f"—\n"
-        f"ℹ️ Dados: Binance (klines). Indicadores: RSI(14), EMA20/50. Suportes/resistências calculados sobre os últimos 120 candles.\n"
-    )
-    return msg
-
-
-# ---------------------------------------
+# ---------------------------------------------------------
 # Handlers Telegram
-# ---------------------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
+# ---------------------------------------------------------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    msg = (
+        "✅ Stark DeFi Brain online.\n"
+        "Envie /eth ou /btc para análise técnica (1h)."
+    )
+    await update.message.reply_text(msg, disable_web_page_preview=True)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong")
+async def eth_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("📈 ETH: preparando análise…")
+    text = await analyze_symbol("ETH")
+    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
 
-async def analyze_and_reply(symbol: str, update: Update):
-    try:
-        df_h1 = await fetch_klines(symbol, "1h", 450)
-        df_m15 = await fetch_klines(symbol, "15m", 450)
+async def btc_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("📈 BTC: preparando análise…")
+    text = await analyze_symbol("BTC")
+    await update.message.reply_text(text, parse_mode="Markdown", disable_web_page_preview=True)
 
-        h1 = analyze_symbol(df_h1, "H1 (1 hora)")
-        m15 = analyze_symbol(df_m15, "M15 (15 minutos)")
+# ---------------------------------------------------------
+# Aiohttp healthcheck (opcional) + webhook do PTB
+# ---------------------------------------------------------
+async def health(request: web.Request):
+    return web.Response(text="ok")
 
-        msg = compose_message(symbol, h1, m15)
-        await update.message.reply_markdown(msg, disable_web_page_preview=True)
-    except Exception as e:
-        log.exception("Erro ao analisar %s", symbol)
-        await update.message.reply_text(f"Erro ao obter análise: {e}")
+def main():
+    application = Application.builder().token(TOKEN).build()
 
-async def cmd_eth(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await analyze_and_reply("ETHUSDT", update)
+    # Comandos
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("eth", eth_handler))
+    application.add_handler(CommandHandler("btc", btc_handler))
 
-async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await analyze_and_reply("BTCUSDT", update)
+    # Aiohttp app para /health
+    webapp = web.Application()
+    webapp.router.add_get("/health", health)
 
-
-# ---------------------------------------
-# App/Server (webhook)
-# ---------------------------------------
-from aiohttp import web
-
-async def handle_health(request):
-    return web.json_response({"ok": True, "ts": datetime.utcnow().isoformat()})
-
-async def handle_webhook(request):
-    """Endpoint que recebe updates do Telegram."""
-    try:
-        app: Application = request.app["bot_app"]
-        data = await request.json()
-        update = Update.de_json(data, app.bot)
-        await app.process_update(update)
-        return web.Response(text="OK")
-    except Exception as e:
-        log.exception("Erro no webhook: %s", e)
-        return web.Response(status=500, text=str(e))
-
-async def on_startup(app: web.Application):
-    """Registra webhook assim que o servidor sobe."""
-    tg_app: Application = app["bot_app"]
-    if WEBHOOK_URL:
-        await tg_app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
-        log.info("Webhook set to %s", WEBHOOK_URL)
-    else:
-        log.warning("RENDER_EXTERNAL_URL ausente. Webhook não registrado.")
-
-def build_telegram_app() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("eth", cmd_eth))
-    app.add_handler(CommandHandler("btc", cmd_btc))
-    return app
-
-def build_web_app(tg_app: Application) -> web.Application:
-    web_app = web.Application()
-    web_app["bot_app"] = tg_app
-    web_app.router.add_post(WEBHOOK_PATH, handle_webhook)
-    web_app.router.add_get("/health", handle_health)
-    web_app.on_startup.append(on_startup)
-    return web_app
+    logger.info("Iniciando webhook em %s", WEBHOOK_URL)
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL,   # PTB 20.3: use 'webhook_url' (não 'webhook_path')
+        web_app=webapp,            # reutilizamos o servidor para expor /health
+    )
 
 if __name__ == "__main__":
-    if not BOT_TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN não configurado")
-
-    application = build_telegram_app()
-    web_app = build_web_app(application)
-
-    log.info("Starting aiohttp app on port %s", PORT)
-    web.run_app(web_app, host="0.0.0.0", port=PORT)
+    main()
