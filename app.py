@@ -56,8 +56,8 @@ if __name__ == "__main__":
 
     # O PTB levanta um servidor aiohttp e registra o webhook no Telegram.
     app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=WEBHOOK_URL,
-        webhook_path=WEBHOOK_PATH,   # onde o Telegram vai dar POST
-    )
+    listen="0.0.0.0",
+    port=PORT,
+    url_path=WEBHOOK_PATH,       # ✅ nome correto na v20.3
+    webhook_url=WEBHOOK_URL,     # deve conter o mesmo path no final
+)
