@@ -1,5 +1,4 @@
 import os
-import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -11,12 +10,12 @@ from telegram.ext import Application, CommandHandler, ContextTypes
 # Config
 # -------------------------------------------------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID    = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
 PORT = int(os.environ.get("PORT", "10000"))
 BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://starkradar-bot.onrender.com").rstrip("/")
 WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
+WEBHOOK_URL  = f"{BASE_URL}{WEBHOOK_PATH}"
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -45,18 +44,12 @@ async def fetch_bybit_ticker(symbol: str, category: str = "linear") -> dict | No
         if not lst:
             return None
         t = lst[0]
-        last_price     = float(t.get("lastPrice") or 0.0)
-        change_24h_pct = float(t.get("price24hPcnt") or 0.0) * 100.0  # fração -> %
-        high_24h       = float(t.get("highPrice24h") or 0.0)
-        low_24h        = float(t.get("lowPrice24h") or 0.0)
-        turnover_24h   = float(t.get("turnover24h") or 0.0)           # USD (perp)
-
         return {
-            "price": last_price,
-            "change_24h": change_24h_pct,
-            "high_24h": high_24h,
-            "low_24h": low_24h,
-            "turnover_24h": turnover_24h,
+            "price": float(t.get("lastPrice") or 0.0),
+            "change_24h": float(t.get("price24hPcnt") or 0.0) * 100.0,  # fração -> %
+            "high_24h": float(t.get("highPrice24h") or 0.0),
+            "low_24h": float(t.get("lowPrice24h") or 0.0),
+            "turnover_24h": float(t.get("turnover24h") or 0.0),
         }
     except Exception as e:
         log.exception(f"Parse error Bybit snapshot {symbol}: {e}")
@@ -93,6 +86,7 @@ async def cmd_eth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Turnover 24h (USD): {snap['turnover_24h']:,.0f}\n"
         f"\n*Fonte:* Bybit v5 Market Tickers."
     )
+    # escapa '-' no MarkdownV2
     await update.message.reply_markdown_v2(txt.replace("-", "\\-"))
 
 async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -112,25 +106,23 @@ async def cmd_btc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_markdown_v2(txt.replace("-", "\\-"))
 
 # -------------------------------------------------------
-# Bootstrap / Webhook
+# Bootstrap / Webhook  (SEM asyncio.run)
 # -------------------------------------------------------
-async def main() -> None:
+def build_app() -> Application:
     if not BOT_TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN ausente")
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("eth", cmd_eth))
     app.add_handler(CommandHandler("btc", cmd_btc))
+    return app
 
-    await app.run_webhook(
+if __name__ == "__main__":
+    application = build_app()
+    # run_webhook gerencia o próprio loop; não usar asyncio.run aqui.
+    application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=WEBHOOK_PATH.lstrip("/"),
         webhook_url=WEBHOOK_URL,
     )
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-
-
