@@ -1,160 +1,51 @@
 import os
-import logging
-from datetime import datetime
-from typing import Optional
-
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, ContextTypes
 )
 
-# ------------------------
-# Config & Logging
-# ------------------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("starkradar")
-
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # opcional (string)
+# --- Variáveis de ambiente ---
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # opcional para envios proativos
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
 PORT = int(os.environ.get("PORT", "10000"))
 
-# Render define essa variável automaticamente na Web Service
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_URL")
-if BASE_URL:
-    BASE_URL = BASE_URL.rstrip("/")
-
-if not TOKEN:
-    raise RuntimeError("Faltou TELEGRAM_BOT_TOKEN no Environment do Render.")
-
-# url path único por segurança
-URL_PATH = f"webhook/{TOKEN}"
+# Defina um caminho interno p/ o webhook (qualquer string curta)
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{RENDER_URL}{WEBHOOK_PATH}" if RENDER_URL else None
 
 
-def _authorized(update: Update) -> bool:
-    """Se TELEGRAM_CHAT_ID estiver setado, só aceita esse chat."""
-    if not ALLOWED_CHAT_ID:
-        return True
-    try:
-        return str(update.effective_chat.id) == str(ALLOWED_CHAT_ID)
-    except Exception:
-        return False
+# --- Handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
+
+async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 ETH: preparando análise… (stub)")
+
+async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("📊 BTC: preparando análise… (stub)")
 
 
-# ------------------------
-# Handlers
-# ------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        return
-    msg = (
-        "✅ Stark DeFi Brain online.\n"
-        "Comandos disponíveis:\n"
-        "• /eth – visão rápida do ETH\n"
-        "• /btc – visão rápida do BTC\n"
-        "• /help – ajuda"
-    )
-    await update.message.reply_text(msg)
+def build_app() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
 
-
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        return
-    await update.message.reply_text(
-        "Ajuda:\n"
-        "• /eth – snapshot técnico do Ethereum (placeholder)\n"
-        "• /btc – snapshot técnico do Bitcoin (placeholder)\n"
-        "• /start – status do bot"
-    )
-
-
-async def eth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        return
-    # placeholder – aqui você poderá plugar sua análise real
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    await update.message.reply_text(
-        f"📊 *ETH:* preparando análise… (placeholder)\n"
-        f"_timestamp: {now}_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def btc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _authorized(update):
-        return
-    # placeholder – aqui você poderá plugar sua análise real
-    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    await update.message.reply_text(
-        f"📊 *BTC:* preparando análise… (placeholder)\n"
-        f"_timestamp: {now}_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-# ------------------------
-# Bootstrap
-# ------------------------
-async def set_my_commands(app: Application) -> None:
-    try:
-        await app.bot.set_my_commands(
-            [
-                ("start", "Status do bot"),
-                ("eth", "Snapshot do Ethereum"),
-                ("btc", "Snapshot do Bitcoin"),
-                ("help", "Ajuda e comandos"),
-            ]
-        )
-        logger.info("Comandos do bot registrados.")
-    except Exception as e:
-        logger.exception("Falha ao registrar comandos: %s", e)
-
-
-async def main() -> None:
-    app = Application.builder().token(TOKEN).concurrent_updates(True).build()
-
-    # Handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("eth", eth))
     app.add_handler(CommandHandler("btc", btc))
 
-    await set_my_commands(app)
-
-    if not BASE_URL:
-        raise RuntimeError(
-            "Faltou RENDER_EXTERNAL_URL (Render) ou BASE_URL no Environment."
-        )
-
-    webhook_url = f"{BASE_URL}/{URL_PATH}"
-    logger.info("Iniciando webhook em %s", webhook_url)
-
-    # Configura e sobe o servidor webhook (sem polling)
-    await app.bot.set_webhook(
-        url=webhook_url,
-        drop_pending_updates=True,
-        allowed_updates=["message", "edited_message"],
-    )
-
-    # Servidor aiohttp embutido do PTB
-    await app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=URL_PATH,          # path local
-        webhook_url=webhook_url,    # URL pública
-        stop_signals=None,
-    )
+    return app
 
 
 if __name__ == "__main__":
-    import asyncio
+    # IMPORTANTE: não use asyncio.run aqui
+    application = build_app()
 
-    try:
-        asyncio.run(main())
-    except (SystemExit, KeyboardInterrupt):
-        logger.info("Bot finalizado.")
+    # Somente WEBHOOK (sem polling)
+    # O PTB define o webhook automaticamente quando você informa `webhook_url`
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,      # caminho local que o servidor irá escutar
+        webhook_url=WEBHOOK_URL,    # URL pública completa do Render
+        drop_pending_updates=True,
+    )
