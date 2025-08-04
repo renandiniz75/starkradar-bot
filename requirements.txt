@@ -1,8 +1,2 @@
-python-telegram-bot==20.3
+python-telegram-bot[webhooks]==20.3
 httpx==0.24.1
-
-# análise opcional (use somente se precisar mesmo)
-pandas==2.2.2
-numpy==1.26.4
-yfinance==0.2.40
-ta==0.10.2
