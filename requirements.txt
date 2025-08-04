@@ -1,14 +1,8 @@
-# Bot e rede
-python-telegram-bot[webhooks]==20.3
+python-telegram-bot==20.3
 httpx==0.24.1
 
-# Data
+# análise opcional (use somente se precisar mesmo)
 pandas==2.2.2
-
-# Numpy com fallback por versão do Python
-numpy==1.26.4 ; python_version < "3.12"
-numpy>=2.2.2   ; python_version >= "3.12"
-
-# Mercado
+numpy==1.26.4
 yfinance==0.2.40
-pandas-ta==0.3.14b0
+ta==0.10.2
