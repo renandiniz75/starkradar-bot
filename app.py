@@ -53,9 +53,4 @@ if __name__ == "__main__":
     log.info("Subindo webhook: %s", webhook_url)
 
     # No PTB v20, o método correto é run_webhook com 'url_path'
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=url_path,
-        webhook_url=webhook_url,  # Telegram vai enviar as atualizações para essa URL pública
-    )
+    app.run_polling(drop_pending_updates=True, close_loop=False)
