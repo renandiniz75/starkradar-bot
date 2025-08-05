@@ -13,14 +13,14 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ============ LOGGING ============
+# ============ LOG ============
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("starkradar")
 
-# ============ ENV & CONST ============
+# ============ ENV ============
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EXTERNAL_URL = (
@@ -28,181 +28,165 @@ EXTERNAL_URL = (
     or os.environ.get("EXTERNAL_URL")
     or "https://starkradar-bot.onrender.com"
 ).rstrip("/")
-
 PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_PATH = f"/{TOKEN}" if TOKEN else "/webhook"
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# HTTPX client (reuso de conexão; headers ajudam a evitar bloqueios)
+# ============ HTTP CLIENT ============
 COMMON_HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+                  "(KHTML, like Gecko) Chrome/126 Safari/537.36",
     "Accept": "application/json",
 }
 HTTP_TIMEOUT = httpx.Timeout(10.0, read=10.0, connect=10.0)
 client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS)
 
 # ============ FEEDS ============
-# Binance 24h
-BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
-
-async def feed_binance(symbol: str) -> dict:
-    r = await client.get(BINANCE_24H, params={"symbol": symbol})
+async def _binance(symbol: str) -> dict:
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    r = await client.get(url, params={"symbol": symbol})
     r.raise_for_status()
     j = r.json()
     return {
-        "src": "Binance",
         "price": float(j["lastPrice"]),
         "high": float(j["highPrice"]),
         "low": float(j["lowPrice"]),
         "pct": float(j["priceChangePercent"]),
-        "vol": float(j.get("quoteVolume") or j.get("volume") or 0.0),
+        "vol": float(j.get("quoteVolume", 0.0)),
+        "src": "Binance",
     }
 
-# Coinbase público
-async def feed_coinbase(product: str) -> dict:
+async def _coinbase(product: str) -> dict:
+    # ticker (price) + stats (open/high/low/volume)
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as cb:
         t = await cb.get(f"https://api.exchange.coinbase.com/products/{product}/ticker")
         t.raise_for_status()
         s = await cb.get(f"https://api.exchange.coinbase.com/products/{product}/stats")
         s.raise_for_status()
-        tj = t.json()
-        sj = s.json()
+        tj, sj = t.json(), s.json()
         price = float(tj["price"])
         high = float(sj["high"])
         low = float(sj["low"])
-        open_ = float(sj.get("open") or price)
+        open_ = float(sj.get("open", price) or price)
         pct = ((price - open_) / open_) * 100 if open_ else 0.0
         vol = float(sj.get("volume", 0.0))
-        return {"src": "Coinbase", "price": price, "high": high, "low": low, "pct": pct, "vol": vol}
+        return {"price": price, "high": high, "low": low, "pct": pct, "vol": vol, "src": "Coinbase"}
 
-# Kraken público
-async def feed_kraken(pair: str) -> dict:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as k:
-        r = await k.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair})
-        r.raise_for_status()
-        j = r.json()
-        res = j["result"]
-        kpair = next(iter(res))
-        d = res[kpair]
-        price = float(d["c"][0])
-        high = float(d["h"][1])
-        low = float(d["l"][1])
-        mid = (high + low) / 2 if (high and low) else price
-        pct = (price - mid) / mid * 100 if mid else 0.0
-        vol = float(d["v"][1])
-        return {"src": "Kraken", "price": price, "high": high, "low": low, "pct": pct, "vol": vol}
+async def _kraken(pair: str) -> dict:
+    url = "https://api.kraken.com/0/public/Ticker"
+    r = await client.get(url, params={"pair": pair})
+    r.raise_for_status()
+    j = r.json()
+    res = j["result"]
+    kpair = next(iter(res.keys()))
+    d = res[kpair]
+    price = float(d["c"][0])
+    high = float(d["h"][1])
+    low = float(d["l"][1])
+    mid = (high + low) / 2 if (high and low) else price
+    pct = (price - mid) / mid * 100 if mid else 0.0
+    vol = float(d["v"][1])
+    return {"price": price, "high": high, "low": low, "pct": pct, "vol": vol, "src": "Kraken"}
 
-# CoinGecko simples
-async def feed_coingecko(coin_id: str) -> dict:
+async def _coingecko(coin_id: str) -> dict:
+    url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
     params = {
         "localization": "false", "tickers": "false", "market_data": "true",
         "community_data": "false", "developer_data": "false", "sparkline": "false",
     }
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as cg:
-        r = await cg.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}", params=params)
+        r = await cg.get(url, params=params)
         r.raise_for_status()
-        j = r.json()
-        md = j["market_data"]
+        md = r.json()["market_data"]
         return {
-            "src": "CoinGecko",
             "price": float(md["current_price"]["usd"]),
             "high": float(md["high_24h"]["usd"]),
             "low": float(md["low_24h"]["usd"]),
             "pct": float(md["price_change_percentage_24h"]),
             "vol": float(md["total_volume"]["usd"]),
+            "src": "CoinGecko",
         }
 
-# Orquestrador com fallbacks
 async def get_stats(asset: str) -> dict:
     """
-    asset: "ETH" ou "BTC"
-    Ordem de tentativas:
-      Binance -> Coinbase -> Kraken -> CoinGecko
+    asset: 'ETH' ou 'BTC'
+    Cadeia de fallback: Binance -> Coinbase -> Kraken -> CoinGecko
     """
     try:
         if asset == "ETH":
-            return await feed_binance("ETHUSDT")
+            return await _binance("ETHUSDT")
         else:
-            return await feed_binance("BTCUSDT")
+            return await _binance("BTCUSDT")
     except Exception as e:
         log.warning("Binance %s falhou: %s", asset, e)
 
     try:
         if asset == "ETH":
-            return await feed_coinbase("ETH-USD")
+            return await _coinbase("ETH-USD")
         else:
-            return await feed_coinbase("BTC-USD")
+            return await _coinbase("BTC-USD")
     except Exception as e:
         log.warning("Coinbase %s falhou: %s", asset, e)
 
     try:
         if asset == "ETH":
-            return await feed_kraken("ETHUSD")
+            return await _kraken("ETHUSD")
         else:
-            return await feed_kraken("XBTUSD")
+            return await _kraken("XBTUSD")
     except Exception as e:
         log.warning("Kraken %s falhou: %s", asset, e)
 
-    # Último fallback
-    if asset == "ETH":
-        return await feed_coingecko("ethereum")
-    else:
-        return await feed_coingecko("bitcoin")
+    # último fallback
+    return await _coingecko("ethereum" if asset == "ETH" else "bitcoin")
 
-# ============ FORMATADORES ============
-def fmt_money(x: float, dec: int = 2) -> str:
-    return f"${x:,.{dec}f}"
-
-def fmt_block(name: str, s: dict) -> str:
+def fmt_stats(name: str, s: dict) -> str:
     arrow = "🔺" if s["pct"] >= 0 else "🔻"
     return (
         f"📊 {name} — fonte: {s['src']}\n"
-        f"• Preço: {fmt_money(s['price'])}\n"
-        f"• 24h: {arrow} {s['pct']:.2f}%  (Alta: {fmt_money(s['high'])} | Baixa: {fmt_money(s['low'])})\n"
-        f"• Vol (24h): {s['vol']:,.0f}\n"
+        f"• Preço: ${s['price']:,.2f}\n"
+        f"• 24h: {arrow} {s['pct']:.2f}%   (Alta: ${s['high']:,.0f} | Baixa: ${s['low']:,.0f})\n"
+        f"• Vol (24h): {s['vol']:,.0f}"
     )
 
-# ============ HANDLERS ============
+# ============ TELEGRAM HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
 
 async def eth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat.id
-    await context.bot.send_message(chat_id=chat, text="📊 ETH: preparando análise…")
     try:
         s = await get_stats("ETH")
-        await context.bot.send_message(chat_id=chat, text=fmt_block("ETH", s))
+        await update.message.reply_text(fmt_stats("ETH", s))
     except Exception as e:
-        log.exception("ETH handler error")
-        await context.bot.send_message(chat_id=chat, text=f"⚠️ Falha ao obter dados de ETH. ({e})")
+        log.exception("ETH handler")
+        await update.message.reply_text(f"⚠️ ETH indisponível agora. ({e})")
 
 async def btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat = update.effective_chat.id
-    await context.bot.send_message(chat_id=chat, text="📊 BTC: preparando análise…")
     try:
         s = await get_stats("BTC")
-        await context.bot.send_message(chat_id=chat, text=fmt_block("BTC", s))
+        await update.message.reply_text(fmt_stats("BTC", s))
     except Exception as e:
-        log.exception("BTC handler error")
-        await context.bot.send_message(chat_id=chat, text=f"⚠️ Falha ao obter dados de BTC. ({e})")
+        log.exception("BTC handler")
+        await update.message.reply_text(f"⚠️ BTC indisponível agora. ({e})")
 
 async def alfa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🚀 /alfa: varredura em desenvolvimento. Em breve, sinais.")
+    await update.message.reply_text("🚀 /alfa em desenvolvimento.")
 
 # ============ JOBS ============
 async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHAT_ID:
-        log.warning("CHAT_ID não configurado; boletim não enviado.")
+        log.warning("CHAT_ID não configurado.")
         return
     try:
         eth = await get_stats("ETH")
         btc = await get_stats("BTC")
-        header = "⏱️ Boletim automático — Stark DeFi Brain"
-        txt = f"{header}\n\n{fmt_block('ETH', eth)}\n{fmt_block('BTC', btc)}"
+        txt = "🧠 Stark DeFi Brain — Boletim automático\n\n" + fmt_stats("ETH", eth) + "\n\n" + fmt_stats("BTC", btc)
         await context.bot.send_message(chat_id=int(CHAT_ID), text=txt)
     except Exception as e:
-        log.exception("send_report error")
+        log.exception("send_report")
+        try:
+            await context.bot.send_message(chat_id=int(CHAT_ID), text=f"⚠️ Falha no boletim: {e}")
+        except Exception:
+            pass
 
 def schedule_jobs(app: Application) -> None:
     jq = app.job_queue
@@ -213,7 +197,7 @@ def schedule_jobs(app: Application) -> None:
         jq.run_daily(send_report, time=time(hour=hh, minute=mm, tzinfo=TZ), name=f"rep_{hh:02d}{mm:02d}")
     log.info("Boletins agendados (BRT): 08:00, 12:00, 17:00, 19:00")
 
-# ============ AIOHTTP + PTB ============
+# ============ AIOHTTP BOOT ============
 async def make_web_app(application: Application) -> web.Application:
     web_app = web.Application()
 
@@ -222,6 +206,8 @@ async def make_web_app(application: Application) -> web.Application:
 
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
+
+    # webhook PTB
     web_app.router.add_post(WEBHOOK_PATH, application.webhook_handler())
 
     async def on_startup(_: web.Application):
