@@ -129,7 +129,7 @@ def schedule_jobs(app: Application) -> None:
     log.info("Boletins agendados (BRT): 08:00, 12:00, 17:00, 19:00")
 
 # =========================
-# AIOHTTP APP + PTB WEBHOOK
+# AIOHTTP APP + PTB (process_update)
 # =========================
 async def make_web_app(application: Application) -> web.Application:
     web_app = web.Application()
@@ -141,16 +141,30 @@ async def make_web_app(application: Application) -> web.Application:
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
 
-    # webhook (POST)
-    web_app.router.add_post(WEBHOOK_PATH, application.webhook_handler())
+    # webhook (POST): converte JSON em Update e envia ao PTB
+    async def handle_webhook(request: web.Request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(text="bad request", status=400)
+
+        try:
+            update = Update.de_json(data, application.bot)
+            await application.process_update(update)
+        except Exception as e:
+            log.exception("Erro processando update: %s", e)
+            return web.Response(text="error", status=500)
+
+        return web.Response(text="ok", status=200)
+
+    web_app.router.add_post(WEBHOOK_PATH, handle_webhook)
 
     async def on_startup(_: web.Application):
-        # Inicializa PTB e webhook
+        # Inicializa PTB
         await application.initialize()
         schedule_jobs(application)
-        # start PTB (inicia JobQueue e despachante)
         await application.start()
-        # registra webhook no Telegram
+        # Registra webhook no Telegram
         full_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
         await application.bot.set_webhook(full_url)
         log.info("Webhook registrado em %s", full_url)
@@ -180,7 +194,6 @@ def main() -> None:
     application.add_handler(CommandHandler("alfa", alfa_cmd))
 
     web_app = make_web_app(application)
-    # roda aiohttp (bloqueante) – Render health-check receberá 200 em "/" e "/health"
     web.run_app(web_app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
