@@ -5,6 +5,7 @@ from datetime import time
 from zoneinfo import ZoneInfo
 
 import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -26,7 +27,6 @@ log = logging.getLogger("starkradar")
 # =========================
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-# URL pública do Render (ou outra). Pode usar RENDER_EXTERNAL_URL ou fallback:
 EXTERNAL_URL = (
     os.environ.get("RENDER_EXTERNAL_URL")
     or os.environ.get("EXTERNAL_URL")
@@ -34,31 +34,19 @@ EXTERNAL_URL = (
 ).rstrip("/")
 
 PORT = int(os.environ.get("PORT", "10000"))
-# Segurança: usar o token no path ajuda a evitar scans:
 WEBHOOK_PATH = f"/{TOKEN}" if TOKEN else "/webhook"
-
-# Fuso horário do Brasil:
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# HTTPX Client (timeout e retry básico)
+# HTTP client
 HTTP_TIMEOUT = httpx.Timeout(10.0, read=10.0, connect=10.0)
 client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
 
 # =========================
-# HELPERS DE MERCADO (BINANCE)
+# MARKET HELPERS (BINANCE)
 # =========================
 BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
 
 async def fetch_binance_24h(symbol: str) -> dict:
-    """
-    Retorna o dicionário da Binance para o ticker 24h do par informado (ex.: ETHUSDT).
-    Campos relevantes:
-      - lastPrice
-      - priceChangePercent
-      - volume
-      - highPrice
-      - lowPrice
-    """
     try:
         r = await client.get(BINANCE_24H, params={"symbol": symbol})
         r.raise_for_status()
@@ -74,15 +62,12 @@ def fmt_num(n: float, dec: int = 2) -> str:
         return str(n)
 
 async def snapshot_msg(symbol: str, label: str) -> str:
-    """
-    Monta mensagem curta de snapshot para um símbolo da Binance (ex.: ETHUSDT -> ETH).
-    """
     data = await fetch_binance_24h(symbol)
     if not data:
         return f"⚠️ {label}: dados indisponíveis agora. Tente em instantes."
 
     last = data.get("lastPrice")
-    pct = data.get("priceChangePercent")
+    pct  = data.get("priceChangePercent")
     high = data.get("highPrice")
     low  = data.get("lowPrice")
     vol  = data.get("volume")
@@ -96,7 +81,7 @@ async def snapshot_msg(symbol: str, label: str) -> str:
     )
 
 # =========================
-# HANDLERS
+# TELEGRAM HANDLERS
 # =========================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
@@ -110,16 +95,12 @@ async def btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_markdown(msg)
 
 async def alfa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Placeholder para oportunidades /alfa
     await update.message.reply_text("🚀 /alfa: varredura em desenvolvimento. Em breve, sinais.")
 
 # =========================
-# JOBS (BOLETINS AUTOMÁTICOS)
+# JOBS (BOLETINS)
 # =========================
 async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """
-    Envia boletim consolidado no CHAT_ID configurado.
-    """
     if not CHAT_ID:
         log.warning("CHAT_ID não configurado. Ignorando envio automático.")
         return
@@ -136,7 +117,6 @@ async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
 def schedule_jobs(app: Application) -> None:
     jq = app.job_queue
     if jq is None:
-        # Guard: não interrompe o serviço caso o extra falhe
         log.warning("JobQueue não disponível. Instale: python-telegram-bot[job-queue]")
         return
 
@@ -149,8 +129,44 @@ def schedule_jobs(app: Application) -> None:
     log.info("Boletins agendados (BRT): 08:00, 12:00, 17:00, 19:00")
 
 # =========================
-# MAIN (WEBHOOK)
+# AIOHTTP APP + PTB WEBHOOK
 # =========================
+async def make_web_app(application: Application) -> web.Application:
+    web_app = web.Application()
+
+    async def health(_: web.Request) -> web.Response:
+        return web.Response(text="ok", status=200)
+
+    # health checks
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/health", health)
+
+    # webhook (POST)
+    web_app.router.add_post(WEBHOOK_PATH, application.webhook_handler())
+
+    async def on_startup(_: web.Application):
+        # Inicializa PTB e webhook
+        await application.initialize()
+        schedule_jobs(application)
+        # start PTB (inicia JobQueue e despachante)
+        await application.start()
+        # registra webhook no Telegram
+        full_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
+        await application.bot.set_webhook(full_url)
+        log.info("Webhook registrado em %s", full_url)
+
+    async def on_cleanup(_: web.Application):
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=False)
+        except Exception:
+            pass
+        await application.stop()
+        await application.shutdown()
+
+    web_app.on_startup.append(on_startup)
+    web_app.on_cleanup.append(on_cleanup)
+    return web_app
+
 def main() -> None:
     if not TOKEN:
         raise RuntimeError("TELEGRAM_BOT_TOKEN não definido")
@@ -158,32 +174,19 @@ def main() -> None:
         raise RuntimeError("EXTERNAL_URL/RENDER_EXTERNAL_URL inválido")
 
     application = Application.builder().token(TOKEN).build()
-
-    # Handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("eth", eth_cmd))
     application.add_handler(CommandHandler("btc", btc_cmd))
     application.add_handler(CommandHandler("alfa", alfa_cmd))
 
-    # Jobs agendados
-    schedule_jobs(application)
-
-    # Inicia webhook (PTB cuida do setWebhook internamente se webhook_url for passado)
-    full_webhook_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
-    log.info("Iniciando webhook em %s", full_webhook_url)
-
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=full_webhook_url,
-    )
+    web_app = make_web_app(application)
+    # roda aiohttp (bloqueante) – Render health-check receberá 200 em "/" e "/health"
+    web.run_app(web_app, host="0.0.0.0", port=PORT)
 
 if __name__ == "__main__":
     try:
         main()
     finally:
-        # Fecha o client HTTPX limpo (se o processo encerrar)
         try:
             import anyio
             anyio.run(client.aclose)
