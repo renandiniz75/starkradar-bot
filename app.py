@@ -7,20 +7,20 @@ from zoneinfo import ZoneInfo
 import httpx
 from aiohttp import web
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
-# =========================
-# LOGGING
-# =========================
+# ============ LOGGING ============
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 log = logging.getLogger("starkradar")
 
-# =========================
-# ENV & CONSTANTES
-# =========================
+# ============ ENV & CONST ============
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 EXTERNAL_URL = (
@@ -33,102 +33,187 @@ PORT = int(os.environ.get("PORT", "10000"))
 WEBHOOK_PATH = f"/{TOKEN}" if TOKEN else "/webhook"
 TZ = ZoneInfo("America/Sao_Paulo")
 
-# =========================
-# HTTP CLIENT
-# =========================
+# HTTPX client (reuso de conexão; headers ajudam a evitar bloqueios)
+COMMON_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
+    "Accept": "application/json",
+}
 HTTP_TIMEOUT = httpx.Timeout(10.0, read=10.0, connect=10.0)
-client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS)
 
-# =========================
-# FEED DE MERCADO (BINANCE)
-# =========================
+# ============ FEEDS ============
+# Binance 24h
 BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
 
-async def fetch_binance_24h(symbol: str) -> dict:
-    try:
-        r = await client.get(BINANCE_24H, params={"symbol": symbol})
+async def feed_binance(symbol: str) -> dict:
+    r = await client.get(BINANCE_24H, params={"symbol": symbol})
+    r.raise_for_status()
+    j = r.json()
+    return {
+        "src": "Binance",
+        "price": float(j["lastPrice"]),
+        "high": float(j["highPrice"]),
+        "low": float(j["lowPrice"]),
+        "pct": float(j["priceChangePercent"]),
+        "vol": float(j.get("quoteVolume") or j.get("volume") or 0.0),
+    }
+
+# Coinbase público
+async def feed_coinbase(product: str) -> dict:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as cb:
+        t = await cb.get(f"https://api.exchange.coinbase.com/products/{product}/ticker")
+        t.raise_for_status()
+        s = await cb.get(f"https://api.exchange.coinbase.com/products/{product}/stats")
+        s.raise_for_status()
+        tj = t.json()
+        sj = s.json()
+        price = float(tj["price"])
+        high = float(sj["high"])
+        low = float(sj["low"])
+        open_ = float(sj.get("open") or price)
+        pct = ((price - open_) / open_) * 100 if open_ else 0.0
+        vol = float(sj.get("volume", 0.0))
+        return {"src": "Coinbase", "price": price, "high": high, "low": low, "pct": pct, "vol": vol}
+
+# Kraken público
+async def feed_kraken(pair: str) -> dict:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as k:
+        r = await k.get("https://api.kraken.com/0/public/Ticker", params={"pair": pair})
         r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        log.warning("Erro Binance 24h %s: %s", symbol, e)
-        return {}
+        j = r.json()
+        res = j["result"]
+        kpair = next(iter(res))
+        d = res[kpair]
+        price = float(d["c"][0])
+        high = float(d["h"][1])
+        low = float(d["l"][1])
+        mid = (high + low) / 2 if (high and low) else price
+        pct = (price - mid) / mid * 100 if mid else 0.0
+        vol = float(d["v"][1])
+        return {"src": "Kraken", "price": price, "high": high, "low": low, "pct": pct, "vol": vol}
 
-def fmt_num(n: float, dec: int = 2) -> str:
+# CoinGecko simples
+async def feed_coingecko(coin_id: str) -> dict:
+    params = {
+        "localization": "false", "tickers": "false", "market_data": "true",
+        "community_data": "false", "developer_data": "false", "sparkline": "false",
+    }
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers=COMMON_HEADERS) as cg:
+        r = await cg.get(f"https://api.coingecko.com/api/v3/coins/{coin_id}", params=params)
+        r.raise_for_status()
+        j = r.json()
+        md = j["market_data"]
+        return {
+            "src": "CoinGecko",
+            "price": float(md["current_price"]["usd"]),
+            "high": float(md["high_24h"]["usd"]),
+            "low": float(md["low_24h"]["usd"]),
+            "pct": float(md["price_change_percentage_24h"]),
+            "vol": float(md["total_volume"]["usd"]),
+        }
+
+# Orquestrador com fallbacks
+async def get_stats(asset: str) -> dict:
+    """
+    asset: "ETH" ou "BTC"
+    Ordem de tentativas:
+      Binance -> Coinbase -> Kraken -> CoinGecko
+    """
     try:
-        return f"{float(n):,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    except Exception:
-        return str(n)
+        if asset == "ETH":
+            return await feed_binance("ETHUSDT")
+        else:
+            return await feed_binance("BTCUSDT")
+    except Exception as e:
+        log.warning("Binance %s falhou: %s", asset, e)
 
-async def snapshot_msg(symbol: str, label: str) -> str:
-    data = await fetch_binance_24h(symbol)
-    if not data:
-        return f"⚠️ {label}: dados indisponíveis agora. Tente em instantes."
+    try:
+        if asset == "ETH":
+            return await feed_coinbase("ETH-USD")
+        else:
+            return await feed_coinbase("BTC-USD")
+    except Exception as e:
+        log.warning("Coinbase %s falhou: %s", asset, e)
 
-    last = data.get("lastPrice")
-    pct  = data.get("priceChangePercent")
-    high = data.get("highPrice")
-    low  = data.get("lowPrice")
-    vol  = data.get("volume")
+    try:
+        if asset == "ETH":
+            return await feed_kraken("ETHUSD")
+        else:
+            return await feed_kraken("XBTUSD")
+    except Exception as e:
+        log.warning("Kraken %s falhou: %s", asset, e)
 
+    # Último fallback
+    if asset == "ETH":
+        return await feed_coingecko("ethereum")
+    else:
+        return await feed_coingecko("bitcoin")
+
+# ============ FORMATADORES ============
+def fmt_money(x: float, dec: int = 2) -> str:
+    return f"${x:,.{dec}f}"
+
+def fmt_block(name: str, s: dict) -> str:
+    arrow = "🔺" if s["pct"] >= 0 else "🔻"
     return (
-        f"📊 {label}\n"
-        f"• Último: **${fmt_num(last, 2)}**\n"
-        f"• 24h: {fmt_num(pct, 2)}%\n"
-        f"• Máx 24h: ${fmt_num(high, 2)} | Mín 24h: ${fmt_num(low, 2)}\n"
-        f"• Vol 24h: {fmt_num(vol, 2)} {label}\n"
+        f"📊 {name} — fonte: {s['src']}\n"
+        f"• Preço: {fmt_money(s['price'])}\n"
+        f"• 24h: {arrow} {s['pct']:.2f}%  (Alta: {fmt_money(s['high'])} | Baixa: {fmt_money(s['low'])})\n"
+        f"• Vol (24h): {s['vol']:,.0f}\n"
     )
 
-# =========================
-# TELEGRAM HANDLERS
-# =========================
+# ============ HANDLERS ============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
 
 async def eth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await snapshot_msg("ETHUSDT", "ETH")
-    await update.message.reply_markdown(msg)
+    chat = update.effective_chat.id
+    await context.bot.send_message(chat_id=chat, text="📊 ETH: preparando análise…")
+    try:
+        s = await get_stats("ETH")
+        await context.bot.send_message(chat_id=chat, text=fmt_block("ETH", s))
+    except Exception as e:
+        log.exception("ETH handler error")
+        await context.bot.send_message(chat_id=chat, text=f"⚠️ Falha ao obter dados de ETH. ({e})")
 
 async def btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await snapshot_msg("BTCUSDT", "BTC")
-    await update.message.reply_markdown(msg)
+    chat = update.effective_chat.id
+    await context.bot.send_message(chat_id=chat, text="📊 BTC: preparando análise…")
+    try:
+        s = await get_stats("BTC")
+        await context.bot.send_message(chat_id=chat, text=fmt_block("BTC", s))
+    except Exception as e:
+        log.exception("BTC handler error")
+        await context.bot.send_message(chat_id=chat, text=f"⚠️ Falha ao obter dados de BTC. ({e})")
 
 async def alfa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("🚀 /alfa: varredura em desenvolvimento. Em breve, sinais.")
 
-# =========================
-# JOBS (BOLETINS)
-# =========================
+# ============ JOBS ============
 async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
     if not CHAT_ID:
-        log.warning("CHAT_ID não configurado. Ignorando envio automático.")
+        log.warning("CHAT_ID não configurado; boletim não enviado.")
         return
-
-    eth = await snapshot_msg("ETHUSDT", "ETH")
-    btc = await snapshot_msg("BTCUSDT", "BTC")
-    header = "🧠 Stark DeFi Brain — Boletim automático"
-    text = f"{header}\n\n{eth}\n{btc}"
     try:
-        await context.bot.send_message(chat_id=int(CHAT_ID), text=text, parse_mode="Markdown")
+        eth = await get_stats("ETH")
+        btc = await get_stats("BTC")
+        header = "⏱️ Boletim automático — Stark DeFi Brain"
+        txt = f"{header}\n\n{fmt_block('ETH', eth)}\n{fmt_block('BTC', btc)}"
+        await context.bot.send_message(chat_id=int(CHAT_ID), text=txt)
     except Exception as e:
-        log.warning("Falha ao enviar boletim: %s", e)
+        log.exception("send_report error")
 
 def schedule_jobs(app: Application) -> None:
     jq = app.job_queue
     if jq is None:
         log.warning("JobQueue não disponível. Instale: python-telegram-bot[job-queue]")
         return
-
     for hh, mm in [(8, 0), (12, 0), (17, 0), (19, 0)]:
-        jq.run_daily(
-            send_report,
-            time=time(hour=hh, minute=mm, tzinfo=TZ),
-            name=f"rep_{hh:02d}{mm:02d}",
-        )
+        jq.run_daily(send_report, time=time(hour=hh, minute=mm, tzinfo=TZ), name=f"rep_{hh:02d}{mm:02d}")
     log.info("Boletins agendados (BRT): 08:00, 12:00, 17:00, 19:00")
 
-# =========================
-# AIOHTTP APP + PTB (webhook manual)
-# =========================
+# ============ AIOHTTP + PTB ============
 async def make_web_app(application: Application) -> web.Application:
     web_app = web.Application()
 
@@ -137,29 +222,12 @@ async def make_web_app(application: Application) -> web.Application:
 
     web_app.router.add_get("/", health)
     web_app.router.add_get("/health", health)
-
-    # Handler manual do webhook (compatível PTB 20.3)
-    async def telegram_webhook(request: web.Request) -> web.Response:
-        try:
-            data = await request.json()
-        except Exception:
-            return web.Response(status=400, text="invalid json")
-        try:
-            update = Update.de_json(data, application.bot)
-            await application.process_update(update)
-        except Exception as e:
-            log.exception("Erro processando update: %s", e)
-            return web.Response(status=500, text="error")
-        return web.Response(text="ok", status=200)
-
-    web_app.router.add_post(WEBHOOK_PATH, telegram_webhook)
+    web_app.router.add_post(WEBHOOK_PATH, application.webhook_handler())
 
     async def on_startup(_: web.Application):
-        # Inicializa e inicia PTB
         await application.initialize()
         schedule_jobs(application)
         await application.start()
-        # Registra webhook no Telegram apontando para nossa rota
         full_url = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
         await application.bot.set_webhook(full_url)
         log.info("Webhook registrado em %s", full_url)
