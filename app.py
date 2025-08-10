@@ -1,15 +1,15 @@
-# app.py — Stark DeFi Agent v5.6.1 (2025-08-10)
-# + Corrige NameError: define AAVE_SUBGRAPH e AAVE_QUERY no arquivo
-# + /chart eth|btc (QuickChart)
-# + /pulse com manchetes (12h), funding/OI, fluxo baleia, vol(1h)
-# + /diag conectividade (Coinbase/Bybit/DB)
-# + /run/news /run/pulse
-# + Webhook plano (/webhook) e opcional com token (/webhook/{token})
+# app.py — Stark DeFi Agent v5.6.2 (2025-08-10)
+# Mudanças:
+# - /pulse reescrito (formatação por seções, comentário explicativo, níveis e ação)
+# - Manchetes: não lista títulos crus; filtra e sintetiza 2–3 itens relevantes
+# - Estatística de derivativos em janela (funding atual; OI nível e delta 8h)
+# - Pequenos hardens em fallback de dados
+# Observação: continua usando Coinbase p/ preço/24h; Bybit p/ funding/OI (com retry); CG como 2º fallback.
 
 import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, json, logging, re
 import datetime as dt
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import asyncpg
@@ -17,14 +17,14 @@ from fastapi import FastAPI, Request, Path, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "5.6.1"
+APP_VERSION = "5.6.2"
 
-# ==== Defaults (pode sobrescrever por ENV; mantive os seus) ====
-DEFAULT_TG_TOKEN = "8349135220:AAFHKrmSexocLxEhtP0XouE0EBmTxllh9lU"
+# ===== Config (pode sobrescrever por ENV) =====
+DEFAULT_TG_TOKEN = "8349135220:AAFHKrmSexocLxEhtP0XouE0EBmTxllh9lU"  # fornecido por você
 DEFAULT_TG_CHAT  = "47045110"
 
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
-DB_URL = os.getenv("DATABASE_URL")  # precisa estar setado no Render/Railway
+DB_URL = os.getenv("DATABASE_URL")
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN)
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID",  DEFAULT_TG_CHAT)
@@ -34,7 +34,6 @@ BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
 BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
 BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 
-# Aave on-chain (pode deixar vazio; subgraph já definido abaixo)
 AAVE_ADDR = os.getenv("AAVE_ADDR", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
@@ -49,7 +48,7 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 NEWS_MAX_H = int(os.getenv("NEWS_MAX_H", "12"))
 NEWS_MAX_ITEMS = int(os.getenv("NEWS_MAX_ITEMS", "5"))
 
-# ==== Endpoints ====
+# ===== Endpoints =====
 BYBIT_API = "https://api.bybit.com"
 BYBIT_PUBLIC_DOMS = ("https://api.bybit.com", "https://api.bybitglobal.com")
 BYBIT_SPOT_QS = "/v5/market/tickers"
@@ -70,9 +69,7 @@ NEWS_FEEDS = [
 TG_SEND   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 TG_PHOTO  = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
 
-# ==== Aave Subgraph (FIX) ====
-# Mantemos aqui explícito para não depender de ENV.
-# Use V3 (Ethereum mainnet) — ajuste se precisar de outra rede/subgraph.
+# ===== Aave Subgraph (fix) =====
 AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
 AAVE_QUERY = """
 query ($user: String!) {
@@ -84,7 +81,7 @@ query ($user: String!) {
 }
 """
 
-# ==== App/Scheduler/DB ====
+# ===== App / DB / Sched =====
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 log = logging.getLogger("stark-defi-agent")
 
@@ -166,7 +163,7 @@ async def db_init():
         await c.execute(CREATE_SQL)
     log.info("DB pronto.")
 
-# ==== HTTP helpers ====
+# ===== HTTP helpers =====
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -223,7 +220,7 @@ def action_line(eth_price: float) -> str:
     if eth_price > ETH_CLOSE:   return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
     return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
 
-# ==== Market snapshots ====
+# ===== Market snapshots =====
 async def get_spot_snapshot() -> dict:
     try:
         ce = await fetch_json_retry(COINBASE_TICK.format(pair="ETH-USD"))
@@ -286,7 +283,7 @@ async def ingest_1m():
     finally:
         last_run["ingest_1m"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# ==== Whales por Coinbase trades ====
+# ===== Whales (proxy via Coinbase trades) =====
 _last_trade_id_cb = None
 _ws_lock = asyncio.Lock()
 
@@ -327,7 +324,7 @@ async def ingest_whales():
     finally:
         last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# ==== Accounts (Bybit priv.) / Aave ====
+# ===== Accounts / Aave =====
 def bybit_sign_qs(secret: str, params: Dict[str, Any]) -> str:
     qs = "&".join([f"{k}={params[k]}" for k in sorted(params)])
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
@@ -381,12 +378,13 @@ async def snapshot_aave() -> List[Dict[str, Any]]:
 
 async def ingest_accounts():
     rows=[]; rows += await snapshot_bybit(); rows += await snapshot_aave()
-    async with pool.acquire() as c:
-        for r in rows:
-            await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
+    if rows:
+        async with pool.acquire() as c:
+            for r in rows:
+                await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
     last_run["ingest_accounts"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# ==== On-chain (opcional) ====
+# ===== On-chain opcional =====
 ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
 async def ingest_onchain_eth(addr: str):
     if not ETHERSCAN_API_KEY:
@@ -412,7 +410,7 @@ async def ingest_onchain_eth(addr: str):
     finally:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# ==== News (RSS) ====
+# ===== News (RSS) =====
 def _parse_rss_items(xml: str) -> List[Dict[str,str]]:
     items=[]
     for m in re.finditer(r"<item>(.*?)</item>", xml, re.DOTALL|re.IGNORECASE):
@@ -455,8 +453,32 @@ async def fetch_news():
     last_run["news"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
     return out
 
-# ==== Comentário / Pulse ====
-def _pct(a,b): return 0.0 if a==0 else (b-a)/a*100.0
+def _synthesize_news(items: List[Tuple[str,str]]) -> List[str]:
+    """Converte manchetes em frases de impacto (heurística simples)."""
+    out=[]
+    for src, t in items[:3]:
+        tl=t.lower()
+        if any(k in tl for k in ("etf", "sec", "approval", "aprov", "spot")):
+            out.append("Possível efeito de **ETF/fluxo regulatório** elevando apetite por risco.")
+        elif any(k in tl for k in ("upgrade", "hard fork", "dencun", "proto-dank", "eip")):
+            out.append("Narrativa **técnica/upgrade** reforçando expectativa de uso e throughput.")
+        elif any(k in tl for k in ("hack", "exploit", "bridge", "rug")):
+            out.append("Risco **segurança/hack** pesando temporariamente no sentimento.")
+        elif any(k in tl for k in ("liquidation", "short squeeze", "long squeeze")):
+            out.append("Movimento **impulsionado por liquidações** em derivativos.")
+        elif any(k in tl for k in ("whale", "flows", "inflow", "outflow", "funds")):
+            out.append("Indícios de **fluxos institucionais/baleias** influenciando direção.")
+        else:
+            out.append("Evento noticioso relevante no período, com impacto moderado.")
+    return list(dict.fromkeys(out))  # dedup
+
+# ===== Estatística janela =====
+def _pct(a,b): 
+    try:
+        return 0.0 if a==0 else (b-a)/a*100.0
+    except Exception:
+        return 0.0
+
 def _stdev(xs):
     n=len(xs); 
     if n<2: return 0.0
@@ -464,62 +486,112 @@ def _stdev(xs):
     var=sum((x-m)**2 for x in xs)/(n-1)
     return var**0.5
 
-async def build_commentary() -> str:
+async def _deriv_stats_window(start: dt.datetime, end: dt.datetime) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Retorna (funding_último, oi_último, oi_delta_8h)."""
+    async with pool.acquire() as c:
+        rows = await c.fetch("SELECT ts,funding,open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+    if not rows: return (None, None, None)
+    first = rows[0]; last = rows[-1]
+    f_last = float(last["funding"]) if last["funding"] is not None else None
+    oi_last = float(last["open_interest"]) if last["open_interest"] is not None else None
+    oi_first = float(first["open_interest"]) if first["open_interest"] is not None else None
+    oi_delta = (oi_last - oi_first) if (oi_last is not None and oi_first is not None) else None
+    return (f_last, oi_last, oi_delta)
+
+# ===== Comentário / Pulse =====
+async def build_commentary_text() -> str:
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=8)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT ts, eth_usd, btc_usd, eth_btc_ratio FROM market_rel WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        deriv = await c.fetch("SELECT ts, funding, open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+        whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts")
         last120 = await c.fetch("SELECT ts, close FROM candles_minute WHERE symbol='ETHUSDT' ORDER BY ts DESC LIMIT 120")
-    if not rows: return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
+        news = await c.fetch("SELECT ts, source, title FROM news_headlines WHERE ts BETWEEN $1 AND $2 ORDER BY ts DESC", start, end)
+    if not rows:
+        return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
+
     eth = [float(r["eth_usd"]) for r in rows]; btc = [float(r["btc_usd"]) for r in rows]; ratio = [float(r["eth_btc_ratio"]) for r in rows]
     eth_chg=_pct(eth[0],eth[-1]); btc_chg=_pct(btc[0],btc[-1]); ratio_chg=_pct(ratio[0],ratio[-1])
-    funding = float(deriv[-1]["funding"]) if deriv and deriv[-1]["funding"] is not None else None
-    oi = float(deriv[-1]["open_interest"]) if deriv and deriv[-1]["open_interest"] is not None else None
+    f_last, oi_last, oi_delta = await _deriv_stats_window(start, end)
+
     buy = sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="BUY")
     sell= sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="SELL")
     flow="neutra"
     if buy>sell*1.3: flow="compradora"
     elif sell>buy*1.3: flow="vendedora"
+
     vol1h=0.0
     if last120:
         prices=[float(r["close"]) for r in reversed(last120)]
         if len(prices)>=60:
             vol1h = _stdev(prices[-60:])/(sum(prices[-60:])/60)*100.0
+
+    # Síntese de impacto de notícias (no máx 3)
+    news_items=[(n["source"], n["title"]) for n in news][:6]
+    news_synth=_synthesize_news(news_items)
+
+    explain=[]
+    # Regras explicativas
+    if eth_chg>0.6 and (oi_delta is not None and oi_delta>0):
+        explain.append("Alta com **OI em alta** sugere entrada de alavancados acompanhando o movimento.")
+    if eth_chg< -0.6 and (oi_delta is not None and oi_delta<0):
+        explain.append("Queda com **redução de OI** indica desenrolamento de posições (longs fechando).")
+    if f_last is not None and f_last>0.001 and eth_chg>0:
+        explain.append("**Funding positivo elevado**: atenção a euforia dos comprados.")
+    if f_last is not None and f_last< -0.0005 and eth_chg<0:
+        explain.append("**Funding negativo** com queda: pressão de shorts consistente.")
+    if flow=="compradora":
+        explain.append("Fluxo de **compras grandes** predominou no período (proxy de baleias).")
+    if flow=="vendedora":
+        explain.append("Fluxo de **vendas grandes** predominou (realização/hedge).")
+    if not explain:
+        explain.append("Movimento consistente com **beta de mercado** e microestrutura (sem anomalias marcantes).")
+
+    # Montagem diagramada
     lines=[]
-    lines.append(f"ETH: {eth_chg:+.2f}% em 8h; " + (f"funding {funding*100:.3f}%/8h, " if funding is not None else "") + (f"OI ~ {oi:,.0f}. " if oi is not None else "") + f"Pressão {flow}; vol(1h) ~ {vol1h:.2f}%.")
-    lines.append(f"BTC: {btc_chg:+.2f}% em 8h; dinâmica {'mais forte' if btc_chg>0 else 'mais fraca'}.")
-    lines.append(f"ETH/BTC: {ratio_chg:+.2f}% em 8h; {'ETH ganhando beta' if ratio_chg>0 else 'BTC dominante'}.")
-    news = await fetch_news()
-    if news:
-        lines.append("🗞️ Manchetes (12h):")
-        for src,t in news: lines.append(f"• [{src}] {t}")
-    if ratio_chg>0 and (funding is None or funding<0.0005): lines.append("Síntese: pró-ETH (força relativa + funding contido).")
-    elif ratio_chg<0 and (funding is not None and funding>0.001): lines.append("Síntese: atenção à euforia (funding alto).")
-    else: lines.append("Síntese: equilíbrio tático; usar gatilhos de preço.")
+    now_local = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    lines.append(f"🕒 {now_local} • Stark DeFi Agent v{APP_VERSION}")
+    lines.append("")
+    lines.append("# 📈 Preço & Faixa (8h)")
+    lines.append(f"• ETH: {eth[-1]:,.2f} USD ({eth_chg:+.2f}%)")
+    lines.append(f"• BTC: {btc[-1]:,.2f} USD ({btc_chg:+.2f}%)")
+    lines.append(f"• ETH/BTC: {ratio[-1]:.5f} ({ratio_chg:+.2f}%)")
+    lines.append("")
+    lines.append("# 🧮 Derivativos")
+    if f_last is not None: lines.append(f"• Funding (ETH): {f_last*100:.3f}%/8h")
+    if oi_last is not None: 
+        if oi_delta is not None:
+            lines.append(f"• Open Interest (ETH): {oi_last:,.0f} (Δ8h {oi_delta:+,.0f})")
+        else:
+            lines.append(f"• Open Interest (ETH): {oi_last:,.0f}")
+    lines.append("")
+    lines.append("# 💧 Fluxo & Volatilidade")
+    lines.append(f"• Fluxo ‘baleias’: {flow}")
+    lines.append(f"• Vol(1h) ≈ {vol1h:.2f}%")
+    lines.append("")
+    lines.append("# 📝 Comentário")
+    for e in explain: lines.append(f"• {e}")
+    if news_synth:
+        lines.append("")
+        lines.append("# 🗞️ Contexto de notícias (filtrado)")
+        for s in news_synth: lines.append(f"• {s}")
+    lines.append("")
+    lines.append("# 🧭 Cenários & Níveis")
+    lines.append("• Suportes: 4.200 / 4.000")
+    lines.append("• Resistências: 4.300 / 4.400")
+    # Ação será adicionada no caller com preço atual
     return "\n".join(lines)
 
 async def latest_pulse_text() -> str:
+    # pega instantâneo mais recente
     async with pool.acquire() as c:
         m = await c.fetchrow("SELECT * FROM market_rel ORDER BY ts DESC LIMIT 1")
-        e = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol='ETHUSDT' ORDER BY ts DESC LIMIT 1")
-        b = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol='BTCUSDT' ORDER BY ts DESC LIMIT 1")
-        d = await c.fetchrow("SELECT * FROM derivatives_snap WHERE symbol='ETHUSDT' AND exchange='bybit' ORDER BY ts DESC LIMIT 1")
-    if not (m and e and b): return "⏳ Aguardando primeiros dados…"
-    now = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
-    eth = float(m["eth_usd"]); btc = float(m["btc_usd"]); ratio = float(m["eth_btc_ratio"])
-    eh, el, bh, bl = e["high"], e["low"], b["high"], b["low"]
-    header=[f"🕒 {now}",
-           f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if isinstance(eh,(int,float)) and isinstance(el,(int,float)) else ""),
-           f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if isinstance(bh,(int,float)) and isinstance(bl,(int,float)) else ""),
-           f"ETH/BTC: {ratio:.5f}"]
-    if d and d["funding"] is not None: header.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
-    if d and d["open_interest"] is not None: header.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
-    header.append(action_line(eth))
-    comment = await build_commentary()
-    return "\n".join(header) + "\n\n" + comment
+    if not m: 
+        return "⏳ Aguardando primeiros dados…"
+    eth = float(m["eth_usd"])
+    base = await build_commentary_text()
+    return base + "\n" + action_line(eth)
 
-# ==== Chart helper (QuickChart) ====
+# ===== Chart helper (QuickChart) =====
 def chart_url(series: List[float], label: str) -> str:
     xs=list(range(len(series)))
     cfg={
@@ -527,13 +599,12 @@ def chart_url(series: List[float], label: str) -> str:
       "data":{"labels": xs, "datasets":[{"label":label, "data": series, "fill": False, "pointRadius": 0, "borderWidth":2}]},
       "options":{"responsive": True, "plugins":{"legend":{"display": False}}}
     }
-    # quickchart aceita o JSON em querystring; escapamos via URL do httpx
     return "https://quickchart.io/chart?w=800&h=400&devicePixelRatio=2&c=" + httpx.URL("").copy_with(query={"": json.dumps(cfg)}).query[1:]
 
-# ==== Telegram tasks ====
+# ===== Telegram tasks =====
 async def send_pulse_to_chat(): await send_tg(await latest_pulse_text())
 
-# ==== Startup ====
+# ===== Startup =====
 @app.on_event("startup")
 async def _startup():
     await db_init()
@@ -549,7 +620,7 @@ async def _startup():
     scheduler.start()
     log.info("Startup OK. Versão %s", APP_VERSION)
 
-# ==== Endpoints ====
+# ===== Endpoints =====
 @app.get("/")
 async def root(): return {"ok": True, "service": "stark-defi-agent", "version": APP_VERSION}
 
@@ -586,7 +657,7 @@ async def run_pulse():
 async def pulse():
     text = await latest_pulse_text(); await send_tg(text); return {"ok": True, "message": text}
 
-# ==== /chart ====
+# ===== /chart =====
 @app.get("/chart")
 async def chart(sym: str = Query("eth", pattern="^(eth|btc)$"), send: bool = True):
     symbol = "ETHUSDT" if sym=="eth" else "BTCUSDT"
@@ -598,7 +669,7 @@ async def chart(sym: str = Query("eth", pattern="^(eth|btc)$"), send: bool = Tru
     if send: await send_photo(url, caption=f"{symbol} – últimas 2h")
     return {"ok": True, "url": url}
 
-# ==== Telegram Webhook ====
+# ===== Telegram Webhook =====
 async def handle_update(update: Dict[str, Any]):
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg: return
@@ -608,15 +679,15 @@ async def handle_update(update: Dict[str, Any]):
         await send_tg("✅ Bot online.\nComandos: /pulse, /chart eth|btc, /eth, /btc, /alfa, /diag, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id); return
     if low == "/pulse": await send_tg(await latest_pulse_text(), chat_id); return
     if low.startswith("/chart"):
-        parts=low.split()
-        sym="eth"
+        parts=low.split(); sym="eth"
         if len(parts)>1 and parts[1] in ("eth","btc"): sym=parts[1]
         await chart(sym=sym, send=True); return
     if low in ("/eth","/btc"):
         snap = await get_spot_snapshot()
         eth = snap["eth"]["price"]; btc = snap["btc"]["price"]; ratio = eth/btc if btc else math.nan
         await send_tg(f"ETH: ${eth:,.2f} | BTC: ${btc:,.2f} | ETH/BTC: {ratio:.5f}\n{action_line(eth)}", chat_id); return
-    if low == "/alfa": await send_tg(await build_commentary(), chat_id); return
+    if low == "/alfa": 
+        await send_tg(await build_commentary_text(), chat_id); return
     if low == "/notes":
         async with pool.acquire() as c:
             rows = await c.fetch("SELECT created_at,text FROM notes ORDER BY id DESC LIMIT 5")
@@ -664,7 +735,7 @@ async def telegram_webhook_token(request: Request, token: str = Path(...)):
     except Exception: logging.exception("Erro no webhook (token).")
     return {"ok": True}
 
-# ==== Diag ====
+# ===== Diag =====
 async def diag_text() -> str:
     lines=["🔧 Diag:"]
     # Coinbase tick
@@ -679,7 +750,7 @@ async def diag_text() -> str:
         ok_cb=False; lines.append(f"- Coinbase tick FAIL: {e}")
     # Bybit fund/OI
     try:
-        f = await fetch_json_retry(BYBIT_FUND); oi = await fetch_json_retry(BYBIT_OI)
+        _ = await fetch_json_retry(BYBIT_FUND); _ = await fetch_json_retry(BYBIT_OI)
         lines.append("- Bybit fund/OI: tentativa OK")
     except Exception:
         lines.append("- Bybit fund/OI: bloqueado/indisponível (Render IP)")
@@ -697,7 +768,7 @@ async def diag_text() -> str:
         lines.append("- Pulse preview pronto.")
     return "\n".join(lines)
 
-# ==== Exports ====
+# ===== Exports =====
 @app.get("/export/notes.csv")
 async def export_notes():
     async with pool.acquire() as c:
