@@ -1,9 +1,10 @@
-# app.py — Stark DeFi Agent v5.6 (2025-08-10)
-# + /chart eth|btc (QuickChart PNG, 120m de candles do DB)
-# + /pulse com manchetes (12h) CoinDesk/Cointelegraph + leitura de fluxo/funding/OI/vol 1h
-# + /diag (latências e conectividade real-time)
+# app.py — Stark DeFi Agent v5.6.1 (2025-08-10)
+# + Corrige NameError: define AAVE_SUBGRAPH e AAVE_QUERY no arquivo
+# + /chart eth|btc (QuickChart)
+# + /pulse com manchetes (12h), funding/OI, fluxo baleia, vol(1h)
+# + /diag conectividade (Coinbase/Bybit/DB)
 # + /run/news /run/pulse
-# Mantém Coinbase primário e fallbacks; webhook /webhook e /webhook/{token}
+# + Webhook plano (/webhook) e opcional com token (/webhook/{token})
 
 import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, json, logging, re
 import datetime as dt
@@ -16,14 +17,14 @@ from fastapi import FastAPI, Request, Path, Query
 from fastapi.responses import JSONResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "5.6"
+APP_VERSION = "5.6.1"
 
-# ==== Defaults (sobrescrevíveis por ENV) ====
+# ==== Defaults (pode sobrescrever por ENV; mantive os seus) ====
 DEFAULT_TG_TOKEN = "8349135220:AAFHKrmSexocLxEhtP0XouE0EBmTxllh9lU"
 DEFAULT_TG_CHAT  = "47045110"
 
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
-DB_URL = os.getenv("DATABASE_URL")
+DB_URL = os.getenv("DATABASE_URL")  # precisa estar setado no Render/Railway
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", DEFAULT_TG_TOKEN)
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID",  DEFAULT_TG_CHAT)
@@ -33,6 +34,7 @@ BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
 BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
 BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 
+# Aave on-chain (pode deixar vazio; subgraph já definido abaixo)
 AAVE_ADDR = os.getenv("AAVE_ADDR", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
@@ -54,8 +56,8 @@ BYBIT_SPOT_QS = "/v5/market/tickers"
 BYBIT_FUND = "https://api.bybit.com/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
 BYBIT_OI   = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
 
-COINBASE_TICK = "https://api.exchange.coinbase.com/products/{pair}/ticker"
-COINBASE_24H  = "https://api.exchange.coinbase.com/products/{pair}/stats"
+COINBASE_TICK   = "https://api.exchange.coinbase.com/products/{pair}/ticker"
+COINBASE_24H    = "https://api.exchange.coinbase.com/products/{pair}/stats"
 COINBASE_TRADES = "https://api.exchange.coinbase.com/products/{pair}/trades"
 
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
@@ -67,6 +69,20 @@ NEWS_FEEDS = [
 
 TG_SEND   = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 TG_PHOTO  = f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto"
+
+# ==== Aave Subgraph (FIX) ====
+# Mantemos aqui explícito para não depender de ENV.
+# Use V3 (Ethereum mainnet) — ajuste se precisar de outra rede/subgraph.
+AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
+AAVE_QUERY = """
+query ($user: String!) {
+  userReserves(where: { user: $user }) {
+    reserve { symbol, decimals }
+    scaledATokenBalance
+    scaledVariableDebt
+  }
+}
+"""
 
 # ==== App/Scheduler/DB ====
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
@@ -218,7 +234,8 @@ async def get_spot_snapshot() -> dict:
             "eth": {"price": float(ce["price"]), "high": float(se["high"]), "low": float(se["low"]), "vol24": float(se.get("volume", "0") or 0)},
             "btc": {"price": float(cb["price"]), "high": float(sb["high"]), "low": float(sb["low"]), "vol24": float(sb.get("volume", "0") or 0)},
         }
-    except Exception: pass
+    except Exception:
+        pass
     for dom in BYBIT_PUBLIC_DOMS:
         try:
             eth = (await fetch_json_retry(f"{dom}{BYBIT_SPOT_QS}", params={"category":"spot","symbol":"ETHUSDT"}))["result"]["list"][0]
@@ -227,7 +244,8 @@ async def get_spot_snapshot() -> dict:
                 "eth": {"price": float(eth["lastPrice"]), "high": float(eth["highPrice"]), "low": float(eth["lowPrice"]), "vol24": math.nan},
                 "btc": {"price": float(btc["lastPrice"]), "high": float(btc["highPrice"]), "low": float(btc["lowPrice"]), "vol24": math.nan},
             }
-        except Exception: continue
+        except Exception:
+            continue
     cg = await fetch_json_retry(COINGECKO_SIMPLE, params={"ids":"ethereum,bitcoin","vs_currencies":"usd"})
     return {"eth":{"price":float(cg["ethereum"]["usd"]),"high":math.nan,"low":math.nan,"vol24":math.nan},
             "btc":{"price":float(cg["bitcoin"]["usd"]), "high":math.nan,"low":math.nan,"vol24":math.nan}}
@@ -236,10 +254,12 @@ async def get_derivatives_snapshot() -> dict:
     funding = None; open_interest = None
     try:
         f = (await fetch_json_retry(BYBIT_FUND))["result"]["list"][0]; funding = float(f["fundingRate"])
-    except Exception: pass
+    except Exception:
+        pass
     try:
         oi = (await fetch_json_retry(BYBIT_OI))["result"]["list"][-1]; open_interest = float(oi["openInterest"])
-    except Exception: pass
+    except Exception:
+        pass
     return {"funding": funding, "oi": open_interest}
 
 async def ingest_1m():
@@ -276,14 +296,18 @@ async def ingest_whales():
     global _last_trade_id_cb
     try:
         async with _ws_lock:
-            try: trades = await fetch_json_retry(COINBASE_TRADES.format(pair="ETH-USD"), params={"limit":"100"})
-            except Exception: trades = []
-            if not trades: last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds"); return
+            try:
+                trades = await fetch_json_retry(COINBASE_TRADES.format(pair="ETH-USD"), params={"limit":"100"})
+            except Exception:
+                trades = []
+            if not trades:
+                last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds"); return
             new=[]
             for t in trades:
                 tid=t.get("trade_id")
                 if _last_trade_id_cb is None or (isinstance(tid,int) and tid>_last_trade_id_cb): new.append(t)
-            if not new: last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds"); return
+            if not new:
+                last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds"); return
             _last_trade_id_cb = max(int(t["trade_id"]) for t in new if "trade_id" in t)
             buy_usd=sell_usd=buy_qty=sell_qty=0.0
             for t in new:
@@ -330,11 +354,9 @@ async def snapshot_bybit() -> List[Dict[str, Any]]:
                 {"venue":"bybit","metric":"ethusdt_perp_size","value": float(pos[0].get("size",0) or 0)},
                 {"venue":"bybit","metric":"ethusdt_perp_leverage","value": float(pos[0].get("leverage",0) or 0)},
             ]
-    except Exception: traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
     return out
-
-AAVE_SUBGRAPH = AAVE_SUBGRAPH
-AAVE_QUERY = AAVE_QUERY
 
 async def snapshot_aave() -> List[Dict[str, Any]]:
     if not AAVE_ADDR: return []
@@ -353,7 +375,8 @@ async def snapshot_aave() -> List[Dict[str, Any]]:
             if d>0: total_debt+=d
         out.append({"venue":"aave","metric":"collateral_proxy","value": total_coll})
         out.append({"venue":"aave","metric":"debt_proxy","value": total_debt})
-    except Exception: traceback.print_exc()
+    except Exception:
+        traceback.print_exc()
     return out
 
 async def ingest_accounts():
@@ -362,6 +385,32 @@ async def ingest_accounts():
         for r in rows:
             await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
     last_run["ingest_accounts"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
+
+# ==== On-chain (opcional) ====
+ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
+async def ingest_onchain_eth(addr: str):
+    if not ETHERSCAN_API_KEY:
+        last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds"); return
+    try:
+        data = await fetch_json_retry(ETHERSCAN_TX.format(addr=addr, key=ETHERSCAN_API_KEY))
+        txs = data.get("result", [])[:10]
+        big=[]
+        for t in txs:
+            val_eth = float(t.get("value","0"))/1e18
+            if val_eth >= 3000:
+                big.append((val_eth, t.get("from"), t.get("to")))
+        if big:
+            ts = dt.datetime.now(dt.UTC)
+            async with pool.acquire() as c:
+                for val_eth, _from, _to in big:
+                    await c.execute(
+                        "INSERT INTO whale_events(ts,venue,side,qty,usd_value,note) VALUES($1,$2,$3,$4,$5,$6)",
+                        ts, "onchain", "ONCHAIN", val_eth, None, f"{_from} -> {_to}"
+                    )
+    except Exception:
+        traceback.print_exc()
+    finally:
+        last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
 # ==== News (RSS) ====
 def _parse_rss_items(xml: str) -> List[Dict[str,str]]:
@@ -376,12 +425,11 @@ def _parse_rss_items(xml: str) -> List[Dict[str,str]]:
     return items
 
 def _rss_date_recent(pub: str, max_hours: int) -> bool:
-    # tenta parse simples: 'Sun, 10 Aug 2025 21:03:00 GMT'
     try:
         dt_pub = dt.datetime.strptime(pub[:25], "%a, %d %b %Y %H:%M:%S").replace(tzinfo=dt.timezone.utc)
         return (dt.datetime.now(dt.timezone.utc)-dt_pub).total_seconds() <= max_hours*3600
     except Exception:
-        return True  # se não parsear, não bloqueia
+        return True
 
 async def fetch_news():
     headlines=[]
@@ -394,14 +442,12 @@ async def fetch_news():
                     headlines.append((url.split("/")[2], it["title"]))
         except Exception:
             continue
-    # dedupe e corta
     seen=set(); out=[]
     for src, t in headlines:
         key=(src, t.lower())
         if key in seen: continue
         seen.add(key); out.append((src, t))
         if len(out)>=NEWS_MAX_ITEMS: break
-    # grava no DB (opcional)
     if out:
         async with pool.acquire() as c:
             for src, t in out:
@@ -409,7 +455,7 @@ async def fetch_news():
     last_run["news"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
     return out
 
-# ==== Comentário 6–8h & Pulse ====
+# ==== Comentário / Pulse ====
 def _pct(a,b): return 0.0 if a==0 else (b-a)/a*100.0
 def _stdev(xs):
     n=len(xs); 
@@ -481,6 +527,7 @@ def chart_url(series: List[float], label: str) -> str:
       "data":{"labels": xs, "datasets":[{"label":label, "data": series, "fill": False, "pointRadius": 0, "borderWidth":2}]},
       "options":{"responsive": True, "plugins":{"legend":{"display": False}}}
     }
+    # quickchart aceita o JSON em querystring; escapamos via URL do httpx
     return "https://quickchart.io/chart?w=800&h=400&devicePixelRatio=2&c=" + httpx.URL("").copy_with(query={"": json.dumps(cfg)}).query[1:]
 
 # ==== Telegram tasks ====
@@ -646,7 +693,7 @@ async def diag_text() -> str:
         lines.append(f"- DB FAIL: {e}")
     # pulse preview
     if ok_cb:
-        txt = await latest_pulse_text()
+        _ = await latest_pulse_text()
         lines.append("- Pulse preview pronto.")
     return "\n".join(lines)
 
