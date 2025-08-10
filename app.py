@@ -1,9 +1,8 @@
-# app.py — Stark DeFi Agent v5.1
-# Ajustes principais:
-# - Bybit v5 assinatura via querystring (corrige 0 snapshots)
-# - /run/accounts para disparo manual
-# - /status com last_run de cada job
-# - Limiar de baleias via WHALE_USD_MIN
+# app.py — Stark DeFi Agent v5.2 (base v5.1 + DB resiliente/health)
+# - Conexão Postgres com retry/backoff (não derruba o app).
+# - /healthz indica estado do DB; /diag/db testa conexão on-demand.
+# - /status mascara senha da DATABASE_URL.
+# - Tasks/rotas toleram ausência temporária de pool.
 
 import os, hmac, hashlib, time, math, csv, io, asyncio, traceback
 import datetime as dt
@@ -14,13 +13,21 @@ import httpx
 import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+# -------------------------------------------------------------------------------------
+# Configuração
+# -------------------------------------------------------------------------------------
+APP_NAME = "stark-defi-agent"
+APP_VERSION = "5.2"
+START_TS = time.time()
 
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
 DB_URL = os.getenv("DATABASE_URL")
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-SEND_ENABLED = bool(TG_TOKEN)
+SEND_ENABLED = bool(TG_TOKEN and TG_CHAT)
 
 BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
 BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
@@ -44,10 +51,12 @@ TG_SEND = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
 
-app = FastAPI(title="stark-defi-agent")
+# -------------------------------------------------------------------------------------
+# App, pool e scheduler
+# -------------------------------------------------------------------------------------
+app = FastAPI(title=APP_NAME, version=APP_VERSION)
 pool: Optional[asyncpg.Pool] = None
-
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+pool_lock = asyncio.Lock()
 scheduler = AsyncIOScheduler(timezone=str(TZ))
 
 last_run = {
@@ -57,6 +66,48 @@ last_run = {
     "ingest_onchain": None,
 }
 
+# -------------------------------------------------------------------------------------
+# Utils
+# -------------------------------------------------------------------------------------
+def mask_db_url(url: Optional[str]) -> str:
+    if not url:
+        return "<missing DATABASE_URL>"
+    try:
+        head, tail = url.split("://", 1)
+        creds, rest = tail.split("@", 1)
+        user = creds.split(":", 1)[0]
+        return f"{head}://{user}:***@{rest}"
+    except Exception:
+        return "<redacted>"
+
+async def fetch_json(url: str, headers: Dict[str,str]|None=None, params: Dict[str,str]|None=None):
+    async with httpx.AsyncClient(timeout=20) as s:
+        r = await s.get(url, headers=headers, params=params)
+        r.raise_for_status()
+        return r.json()
+
+async def send_tg(text: str, chat_id: Optional[str] = None):
+    if not SEND_ENABLED: return
+    cid = chat_id or TG_CHAT
+    if not cid: return
+    try:
+        async with httpx.AsyncClient(timeout=12) as s:
+            await s.post(TG_SEND, json={"chat_id": cid, "text": text})
+    except Exception:
+        pass
+
+def action_line(eth_price: float) -> str:
+    if eth_price < ETH_HEDGE_2:
+        return f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH)."
+    if eth_price < ETH_HEDGE_1:
+        return f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH)."
+    if eth_price > ETH_CLOSE:
+        return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
+    return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
+
+# -------------------------------------------------------------------------------------
+# SQL / Schema
+# -------------------------------------------------------------------------------------
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS candles_minute(
   ts timestamptz NOT NULL,
@@ -111,37 +162,49 @@ CREATE TABLE IF NOT EXISTS whale_events(
 );
 """
 
-async def db_init():
+# -------------------------------------------------------------------------------------
+# DB: criação de pool resiliente (retry/backoff) + init schema
+# -------------------------------------------------------------------------------------
+async def _try_create_pool_once() -> Optional[asyncpg.Pool]:
     if not DB_URL:
-        raise RuntimeError("DATABASE_URL não definido.")
+        return None
+    try:
+        return await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    except Exception:
+        return None
+
+async def ensure_pool_with_retry(max_attempts: int = 10, base_delay: float = 1.0, max_delay: float = 32.0) -> None:
+    """Cria o pool com backoff exponencial; se falhar, não derruba o app."""
     global pool
-    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
-    async with pool.acquire() as c:
-        await c.execute(CREATE_SQL)
+    if pool is not None:
+        return
+    async with pool_lock:
+        if pool is not None:
+            return
+        delay = base_delay
+        for attempt in range(1, max_attempts + 1):
+            p = await _try_create_pool_once()
+            if p:
+                pool = p
+                print(f"[DB] ✅ pool criado (tentativa {attempt}) | {mask_db_url(DB_URL)}")
+                await _init_schema_safe()
+                return
+            print(f"[DB] ⚠️ falha {attempt}/{max_attempts}; retry em {delay:.1f}s | {mask_db_url(DB_URL)}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+        print("[DB] ❌ não foi possível criar o pool agora; seguiremos tentando em background.")
 
-async def fetch_json(url: str, headers: Dict[str,str]|None=None, params: Dict[str,str]|None=None):
-    async with httpx.AsyncClient(timeout=15) as s:
-        r = await s.get(url, headers=headers, params=params)
-        r.raise_for_status()
-        return r.json()
+async def _init_schema_safe():
+    if not pool: return
+    try:
+        async with pool.acquire() as c:
+            await c.execute(CREATE_SQL)
+    except Exception:
+        traceback.print_exc()
 
-async def send_tg(text: str, chat_id: Optional[str] = None):
-    if not SEND_ENABLED: return
-    cid = chat_id or TG_CHAT
-    if not cid: return
-    async with httpx.AsyncClient(timeout=12) as s:
-        await s.post(TG_SEND, json={"chat_id": cid, "text": text})
-
-def action_line(eth_price: float) -> str:
-    if eth_price < ETH_HEDGE_2:
-        return f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH)."
-    if eth_price < ETH_HEDGE_1:
-        return f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH)."
-    if eth_price > ETH_CLOSE:
-        return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
-    return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
-
-# --------- Market snapshots (1m) ----------
+# -------------------------------------------------------------------------------------
+# Ingest: Mercado (1m)
+# -------------------------------------------------------------------------------------
 async def get_spot_snapshot() -> dict:
     try:
         eth = (await fetch_json(BYBIT_SPOT.format(sym="ETHUSDT")))["result"]["list"][0]
@@ -153,7 +216,7 @@ async def get_spot_snapshot() -> dict:
         return out
     except Exception:
         traceback.print_exc()
-        # fallback minimal
+        # fallback mínimo
         cg = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd")
         return {
             "eth": {"price": float(cg["ethereum"]["usd"]), "high": math.nan, "low": math.nan},
@@ -182,32 +245,36 @@ async def ingest_1m():
         eth_p = spot["eth"]["price"]; btc_p = spot["btc"]["price"]
         eth_h = spot["eth"]["high"];  eth_l = spot["eth"]["low"]
         btc_h = spot["btc"]["high"];  btc_l = spot["btc"]["low"]
-        ethbtc = eth_p / btc_p
-        async with pool.acquire() as c:
-            await c.execute(
-                "INSERT INTO candles_minute(ts,symbol,open,high,low,close,volume) VALUES($1,$2,NULL,$3,$4,$5,NULL) "
-                "ON CONFLICT (ts,symbol) DO UPDATE SET high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close",
-                now, "ETHUSDT", eth_h, eth_l, eth_p
-            )
-            await c.execute(
-                "INSERT INTO candles_minute(ts,symbol,open,high,low,close,volume) VALUES($1,$2,NULL,$3,$4,$5,NULL) "
-                "ON CONFLICT (ts,symbol) DO UPDATE SET high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close",
-                now, "BTCUSDT", btc_h, btc_l, btc_p
-            )
-            await c.execute(
-                "INSERT INTO market_rel(ts,eth_usd,btc_usd,eth_btc_ratio) VALUES($1,$2,$3,$4) "
-                "ON CONFLICT (ts) DO UPDATE SET eth_usd=EXCLUDED.eth_usd, btc_usd=EXCLUDED.btc_usd, eth_btc_ratio=EXCLUDED.eth_btc_ratio",
-                now, eth_p, btc_p, ethbtc
-            )
-            await c.execute(
-                "INSERT INTO derivatives_snap(ts,symbol,exchange,funding,open_interest) VALUES($1,$2,$3,$4,$5) "
-                "ON CONFLICT (ts,symbol,exchange) DO UPDATE SET funding=EXCLUDED.funding, open_interest=EXCLUDED.open_interest",
-                now, "ETHUSDT", "bybit", der["funding"], der["oi"]
-            )
+        ethbtc = eth_p / btc_p if (eth_p and btc_p) else None
+
+        if pool:
+            async with pool.acquire() as c:
+                await c.execute(
+                    "INSERT INTO candles_minute(ts,symbol,open,high,low,close,volume) VALUES($1,$2,NULL,$3,$4,$5,NULL) "
+                    "ON CONFLICT (ts,symbol) DO UPDATE SET high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close",
+                    now, "ETHUSDT", eth_h, eth_l, eth_p
+                )
+                await c.execute(
+                    "INSERT INTO candles_minute(ts,symbol,open,high,low,close,volume) VALUES($1,$2,NULL,$3,$4,$5,NULL) "
+                    "ON CONFLICT (ts,symbol) DO UPDATE SET high=EXCLUDED.high, low=EXCLUDED.low, close=EXCLUDED.close",
+                    now, "BTCUSDT", btc_h, btc_l, btc_p
+                )
+                await c.execute(
+                    "INSERT INTO market_rel(ts,eth_usd,btc_usd,eth_btc_ratio) VALUES($1,$2,$3,$4) "
+                    "ON CONFLICT (ts) DO UPDATE SET eth_usd=EXCLUDED.eth_usd, btc_usd=EXCLUDED.btc_usd, eth_btc_ratio=EXCLUDED.eth_btc_ratio",
+                    now, eth_p, btc_p, ethbtc
+                )
+                await c.execute(
+                    "INSERT INTO derivatives_snap(ts,symbol,exchange,funding,open_interest) VALUES($1,$2,$3,$4,$5) "
+                    "ON CONFLICT (ts,symbol,exchange) DO UPDATE SET funding=EXCLUDED.funding, open_interest=EXCLUDED.open_interest",
+                    now, "ETHUSDT", "bybit", der["funding"], der["oi"]
+                )
     finally:
         last_run["ingest_1m"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- Whales (30s) ----------
+# -------------------------------------------------------------------------------------
+# Ingest: Baleias (30s) via recent-trade agregado
+# -------------------------------------------------------------------------------------
 _last_trade_time_ms = 0
 _ws_lock = asyncio.Lock()
 
@@ -232,7 +299,7 @@ async def ingest_whales():
             events=[]
             if buy_usd>=WHALE_USD_MIN: events.append(("BUY", buy_qty,  buy_usd,  f"agg {len(new)} trades"))
             if sell_usd>=WHALE_USD_MIN: events.append(("SELL", sell_qty, sell_usd, f"agg {len(new)} trades"))
-            if events:
+            if events and pool:
                 async with pool.acquire() as c:
                     for side, qty, usd, note in events:
                         await c.execute(
@@ -244,11 +311,12 @@ async def ingest_whales():
     finally:
         last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- Accounts (5m) ----------
+# -------------------------------------------------------------------------------------
+# Bybit Private (contas) + Aave (5m)
+# -------------------------------------------------------------------------------------
 BYBIT_API = "https://api.bybit.com"
 
 def bybit_sign_qs(secret: str, params: Dict[str, Any]) -> str:
-    # assinatura v5: concatenação key=val ordenada por chave
     qs = "&".join([f"{k}={params[k]}" for k in sorted(params)])
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
 
@@ -271,7 +339,7 @@ async def snapshot_bybit() -> List[Dict[str, Any]]:
         r = await bybit_private_get("/v5/account/wallet-balance", {"accountType": BYBIT_ACCOUNT_TYPE})
         lst = r.get("result",{}).get("list",[])
         if lst:
-            out.append({"venue":"bybit","metric":"total_equity","value": float(lst[0].get("totalEquity",0))})
+            out.append({"venue":"bybit","metric":"total_equity","value": float(lst[0].get("totalEquity",0) or 0)})
         r2 = await bybit_private_get("/v5/position/list", {"category":"linear","symbol":"ETHUSDT"})
         pos = r2.get("result",{}).get("list",[])
         if pos:
@@ -283,7 +351,6 @@ async def snapshot_bybit() -> List[Dict[str, Any]]:
         traceback.print_exc()
     return out
 
-# Aave via subgraph (proxy simples)
 AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
 AAVE_QUERY = """
 query ($user: String!) {
@@ -320,17 +387,17 @@ async def ingest_accounts():
     rows=[]
     rows += await snapshot_bybit()
     rows += await snapshot_aave()
-    if not rows: 
-        last_run["ingest_accounts"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
-        return
-    async with pool.acquire() as c:
-        for r in rows:
-            await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
+    if rows and pool:
+        async with pool.acquire() as c:
+            for r in rows:
+                await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
     last_run["ingest_accounts"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- On-chain (opcional, 5m) ----------
+# -------------------------------------------------------------------------------------
+# On-chain opcional (5m)
+# -------------------------------------------------------------------------------------
 async def ingest_onchain_eth(addr: str):
-    if not ETHERSCAN_API_KEY: 
+    if not ETHERSCAN_API_KEY:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
         return
     try:
@@ -341,7 +408,7 @@ async def ingest_onchain_eth(addr: str):
             val_eth = float(t.get("value","0"))/1e18
             if val_eth >= 3000:
                 big.append((val_eth, t.get("from"), t.get("to")))
-        if big:
+        if big and pool:
             ts = dt.datetime.now(dt.UTC)
             async with pool.acquire() as c:
                 for val_eth, _from, _to in big:
@@ -354,25 +421,37 @@ async def ingest_onchain_eth(addr: str):
     finally:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- Comentário 6–8h ---------
+# -------------------------------------------------------------------------------------
+# Comentários 6–8h + Pulse
+# -------------------------------------------------------------------------------------
 async def build_commentary() -> str:
+    if not pool:
+        return "⏳ Aguardando conexão com o banco para gerar comentário."
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=8)
-    async with pool.acquire() as c:
-        rows = await c.fetch("SELECT ts, eth_usd, btc_usd, eth_btc_ratio FROM market_rel WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        deriv = await c.fetch("SELECT ts, funding, open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+    try:
+        async with pool.acquire() as c:
+            rows = await c.fetch("SELECT ts, eth_usd, btc_usd, eth_btc_ratio FROM market_rel WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+            deriv = await c.fetch("SELECT ts, funding, open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+            whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+    except Exception:
+        return "⚠️ Sem dados suficientes no período recente."
+
     if not rows: return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
     eth = [float(r["eth_usd"]) for r in rows]; btc = [float(r["btc_usd"]) for r in rows]; ratio = [float(r["eth_btc_ratio"]) for r in rows]
     def pct(a,b): return 0.0 if a==0 else (b-a)/a*100.0
     eth_chg = pct(eth[0], eth[-1]); btc_chg = pct(btc[0], btc[-1]); ratio_chg = pct(ratio[0], ratio[-1])
-    funding = deriv[-1]["funding"] if deriv else None; oi = deriv[-1]["open_interest"] if deriv else None
+    funding = float(deriv[-1]["funding"]) if (deriv and deriv[-1]["funding"] is not None) else None
+    oi = float(deriv[-1]["open_interest"]) if (deriv and deriv[-1]["open_interest"] is not None) else None
     buy = sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="BUY")
     sell= sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="SELL")
-    flow = "neutra"; 
+    flow = "neutra"
     if buy>sell*1.3: flow="compradora"
     elif sell>buy*1.3: flow="vendedora"
     lines=[]
-    lines.append(f"ETH: {eth_chg:+.2f}% em 8h; " + (f"funding {float(funding)*100:.3f}%/8h, " if funding is not None else "") + (f"OI ~ {float(oi):,.0f}. " if oi is not None else "") + f"Pressão {flow}.")
+    if funding is not None and oi is not None:
+        lines.append(f"ETH: {eth_chg:+.2f}% em 8h; funding {funding*100:.3f}%/8h; OI ~ {oi:,.0f}; pressão {flow}.")
+    else:
+        lines.append(f"ETH: {eth_chg:+.2f}% em 8h; pressão {flow}.")
     lines.append(f"BTC: {btc_chg:+.2f}% em 8h; dinâmica mais {'forte' if btc_chg>0 else 'fraca'}.")
     lines.append(f"ETH/BTC: {ratio_chg:+.2f}% em 8h; {'ETH ganhando beta' if ratio_chg>0 else 'BTC dominante'}.")
     if ratio_chg>0 and (funding is None or funding<0.0005): lines.append("Síntese: pró-ETH (força relativa + funding contido).")
@@ -381,6 +460,8 @@ async def build_commentary() -> str:
     return "\n".join(lines)
 
 async def latest_pulse_text() -> str:
+    if not pool:
+        return "⏳ Aguardando conexão com o banco…"
     async with pool.acquire() as c:
         m = await c.fetchrow("SELECT * FROM market_rel ORDER BY ts DESC LIMIT 1")
         e = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol='ETHUSDT' ORDER BY ts DESC LIMIT 1")
@@ -397,20 +478,21 @@ async def latest_pulse_text() -> str:
     if d and d["funding"] is not None: parts.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
     if d and d["open_interest"] is not None: parts.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
     # ação
-    if eth < ETH_HEDGE_2: parts.append(f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH).")
-    elif eth < ETH_HEDGE_1: parts.append(f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH).")
-    elif eth > ETH_CLOSE: parts.append(f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge.")
-    else: parts.append("✅ Sem gatilho imediato.")
+    parts.append(action_line(eth))
     comment = await build_commentary()
     return "\n".join(parts) + "\n\n" + comment
 
 async def send_pulse_to_chat():
     await send_tg(await latest_pulse_text())
 
-# --------- FastAPI ---------
+# -------------------------------------------------------------------------------------
+# Startup / Shutdown
+# -------------------------------------------------------------------------------------
 @app.on_event("startup")
 async def _startup():
-    await db_init()
+    # tenta conectar DB em background (não bloqueia boot)
+    asyncio.create_task(ensure_pool_with_retry())
+    # agenda jobs
     scheduler.add_job(ingest_1m, "interval", minutes=1, id="ingest_1m", replace_existing=True)
     scheduler.add_job(ingest_whales, "interval", seconds=30, id="ingest_whales", replace_existing=True)
     scheduler.add_job(ingest_accounts, "interval", minutes=5, id="ingest_accounts", replace_existing=True)
@@ -420,26 +502,53 @@ async def _startup():
     scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
     scheduler.start()
+    print(f"[APP] ✅ start {APP_NAME} v{APP_VERSION} | TZ={TZ.key}")
 
+@app.on_event("shutdown")
+async def _shutdown():
+    global pool
+    try:
+        scheduler.shutdown(wait=False)
+    except Exception:
+        pass
+    if pool:
+        await pool.close()
+        pool = None
+        print("[DB] 🔻 pool fechado")
+
+# -------------------------------------------------------------------------------------
+# Rotas
+# -------------------------------------------------------------------------------------
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
+    db_ok = False
+    if pool:
+        try:
+            async with pool.acquire() as c:
+                await c.execute("select 1;")
+            db_ok = True
+        except Exception:
+            db_ok = False
+    return {"ok": True, "db": db_ok, "uptime_sec": round(time.time() - START_TS, 1)}
 
 @app.get("/status")
 async def status():
-    async with pool.acquire() as c:
-        mr = await c.fetchval("SELECT COUNT(1) FROM market_rel")
-        cm_eth = await c.fetchval("SELECT COUNT(1) FROM candles_minute WHERE symbol='ETHUSDT'")
-        cm_btc = await c.fetchval("SELECT COUNT(1) FROM candles_minute WHERE symbol='BTCUSDT'")
-        ds = await c.fetchval("SELECT COUNT(1) FROM derivatives_snap")
-        whales = await c.fetchval("SELECT COUNT(1) FROM whale_events")
-        acc = await c.fetchval("SELECT COUNT(1) FROM account_snap")
+    counts = {"market_rel": 0, "candles_eth": 0, "candles_btc": 0, "derivatives": 0, "whale_events": 0, "account_snap": 0}
+    if pool:
+        try:
+            async with pool.acquire() as c:
+                counts["market_rel"] = await c.fetchval("SELECT COUNT(1) FROM market_rel")
+                counts["candles_eth"] = await c.fetchval("SELECT COUNT(1) FROM candles_minute WHERE symbol='ETHUSDT'")
+                counts["candles_btc"] = await c.fetchval("SELECT COUNT(1) FROM candles_minute WHERE symbol='BTCUSDT'")
+                counts["derivatives"] = await c.fetchval("SELECT COUNT(1) FROM derivatives_snap")
+                counts["whale_events"] = await c.fetchval("SELECT COUNT(1) FROM whale_events")
+                counts["account_snap"] = await c.fetchval("SELECT COUNT(1) FROM account_snap")
+        except Exception:
+            pass
     return {
-        "counts":{
-            "market_rel": mr, "candles_eth": cm_eth, "candles_btc": cm_btc,
-            "derivatives": ds, "whale_events": whales, "account_snap": acc
-        },
-        "last_run": last_run
+        "app": APP_NAME, "version": APP_VERSION, "tz": TZ.key,
+        "db_url": mask_db_url(DB_URL), "pool_active": pool is not None,
+        "counts": counts, "last_run": last_run
     }
 
 @app.post("/run/accounts")
@@ -453,26 +562,48 @@ async def pulse():
     await send_tg(text)
     return {"ok": True, "message": text}
 
+@app.get("/diag/db")
+async def diag_db():
+    # tenta criar pool rápido se ainda não há
+    if not pool:
+        await ensure_pool_with_retry(max_attempts=2, base_delay=0.5, max_delay=2.0)
+    if not pool:
+        return JSONResponse({"ok": False, "msg": "pool indisponível"}, status_code=503)
+    try:
+        async with pool.acquire() as c:
+            row = await c.fetchrow("select version() v, now() ts")
+        return {"ok": True, "version": row["v"], "now": row["ts"].isoformat()}
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# -------------------------- Telegram Webhook --------------------------
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    try: update = await request.json()
-    except Exception: return {"ok": True}
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg: return {"ok": True}
     chat_id = str(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
     low = text.lower()
+
     if low in ("/start","start"):
         await send_tg("✅ Bot online. Comandos: /pulse, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id); return {"ok": True}
     if low == "/pulse":
         await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
     if low == "/notes":
+        if not pool:
+            await send_tg("⏳ Sem conexão com o banco.", chat_id); return {"ok": True}
         async with pool.acquire() as c:
             rows = await c.fetch("SELECT created_at,text FROM notes ORDER BY id DESC LIMIT 5")
         if not rows: await send_tg("Sem notas ainda.", chat_id); return {"ok": True}
         out=["Notas recentes:"]+[f"- {r['created_at']:%m-%d %H:%M} • {r['text']}" for r in rows]
         await send_tg("\n".join(out), chat_id); return {"ok": True}
     if low == "/strat last":
+        if not pool:
+            await send_tg("⏳ Sem conexão com o banco.", chat_id); return {"ok": True}
         async with pool.acquire() as c:
             row = await c.fetchrow("SELECT created_at,name,version,note FROM strategy_versions ORDER BY id DESC LIMIT 1")
         if not row: await send_tg("Nenhuma estratégia salva.", chat_id); return {"ok": True}
@@ -480,6 +611,8 @@ async def telegram_webhook(request: Request):
     if low.startswith("/note"):
         note = text[len("/note"):].strip()
         if not note: await send_tg("Uso: /note seu texto aqui", chat_id); return {"ok": True}
+        if not pool:
+            await send_tg("⏳ Sem conexão com o banco.", chat_id); return {"ok": True}
         async with pool.acquire() as c:
             await c.execute("INSERT INTO notes(tag,text) VALUES($1,$2)", None, note)
         await send_tg("📝 Nota salva.", chat_id); return {"ok": True}
@@ -489,14 +622,22 @@ async def telegram_webhook(request: Request):
             name, version, note = [p.strip() for p in payload.split("|", 2)]
         except Exception:
             await send_tg("Uso: /strat new <nome> | <versão> | <nota>", chat_id); return {"ok": True}
+        if not pool:
+            await send_tg("⏳ Sem conexão com o banco.", chat_id); return {"ok": True}
         async with pool.acquire() as c:
             await c.execute("INSERT INTO strategy_versions(name,version,note) VALUES($1,$2,$3)", name, version, note)
         await send_tg(f"📌 Estratégia salva: {name} v{version}", chat_id); return {"ok": True}
+
     await send_tg("Comando não reconhecido. Use /pulse, /note, /strat new, /strat last, /notes.", chat_id)
     return {"ok": True}
 
+# -------------------------------------------------------------------------------------
+# Exports
+# -------------------------------------------------------------------------------------
 @app.get("/export/notes.csv")
 async def export_notes():
+    if not pool:
+        return PlainTextResponse("Sem conexão com o banco.", status_code=503)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT created_at, tag, text FROM notes ORDER BY id DESC")
     buf = io.StringIO(); w = csv.writer(buf)
@@ -506,6 +647,8 @@ async def export_notes():
 
 @app.get("/export/strats.csv")
 async def export_strats():
+    if not pool:
+        return PlainTextResponse("Sem conexão com o banco.", status_code=503)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT created_at, name, version, note FROM strategy_versions ORDER BY id DESC")
     buf = io.StringIO(); w = csv.writer(buf)
@@ -515,6 +658,8 @@ async def export_strats():
 
 @app.get("/accounts/last")
 async def accounts_last():
+    if not pool:
+        return JSONResponse({"rows": []})
     async with pool.acquire() as c:
         rows = await c.fetch("""
             SELECT * FROM account_snap
