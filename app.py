@@ -1,17 +1,21 @@
-# app.py — Stark DeFi Agent (Railway) v2
+# app.py — Stark DeFi Agent (Railway) v3
 # FastAPI + APScheduler + asyncpg + httpx
-# Rotas: /healthz, /pulse (GET), /webhook (POST Telegram)
-# Features: Bybit -> Binance -> CoinGecko fallback; DB histórico; memória de estratégias/notes.
+# Features:
+# - Boletins automáticos 08:00, 14:00, 20:00 (America/Sao_Paulo)
+# - Ingestão 1-min (ETH/BTC spot, funding, OI) com fallbacks (Bybit -> Binance -> CoinGecko)
+# - Memória (notes/strategy_versions) + CSV export
+# - Telegram webhook (/webhook) + /pulse
+# - Snapshots de contas: Bybit (RO) e Aave (se variáveis existirem)
 
-import os, math, json, traceback
+import os, math, json, hmac, hashlib, time, csv, io, traceback
 import datetime as dt
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Optional, Dict, Any, List
 
 import httpx
 import asyncpg
-from fastapi import FastAPI, Request
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import PlainTextResponse, JSONResponse
 
 # ---------- Config ----------
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
@@ -24,17 +28,25 @@ ETH_HEDGE_1 = float(os.getenv("ETH_HEDGE_1", "3900"))
 ETH_HEDGE_2 = float(os.getenv("ETH_HEDGE_2", "3800"))
 ETH_CLOSE   = float(os.getenv("ETH_CLOSE_HEDGE", "3950"))
 
+# Bybit RO (opcional)
+BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
+BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
+# Aave (opcional)
+AAVE_ADDR = os.getenv("AAVE_ADDR", "")  # seu endereço EVM
+
 # Market providers
 BYBIT_SPOT = "https://api.bybit.com/v5/market/tickers?category=spot&symbol={sym}"
 BYBIT_FUND = "https://api.bybit.com/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
 BYBIT_OI   = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
-BINANCE_SPOT = "https://api.binance.com/api/v3/ticker/24hr?symbol={sym}"  # e.g., ETHUSDT
+BINANCE_SPOT = "https://api.binance.com/api/v3/ticker/24hr?symbol={sym}"  # ETHUSDT/BTCUSDT
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd"
 TG_SEND    = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# ---------- App ----------
 app = FastAPI(title="stark-defi-agent")
 pool: Optional[asyncpg.Pool] = None
+
+# ---------- Scheduler ----------
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 scheduler = AsyncIOScheduler(timezone=str(TZ))
 
 # ---------- DB Schema ----------
@@ -77,6 +89,14 @@ CREATE TABLE IF NOT EXISTS actions_log(
   action text NOT NULL,
   details jsonb
 );
+-- snapshots de conta (venue=bybit/aave)
+CREATE TABLE IF NOT EXISTS account_snap(
+  ts timestamptz NOT NULL DEFAULT now(),
+  venue text NOT NULL,
+  metric text NOT NULL,
+  value numeric,
+  PRIMARY KEY (ts, venue, metric)
+);
 """
 
 # ---------- Boot ----------
@@ -89,20 +109,11 @@ async def db_init():
         await c.execute(CREATE_SQL)
 
 # ---------- Helpers ----------
-async def fetch_json(url: str):
-    async with httpx.AsyncClient(timeout=12) as s:
-        r = await s.get(url)
+async def fetch_json(url: str, headers: Dict[str, str] | None = None, params: Dict[str, str] | None = None):
+    async with httpx.AsyncClient(timeout=15) as s:
+        r = await s.get(url, headers=headers, params=params)
         r.raise_for_status()
         return r.json()
-
-def action_line(eth_price: float) -> str:
-    if eth_price < ETH_HEDGE_2:
-        return f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH)."
-    if eth_price < ETH_HEDGE_1:
-        return f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH)."
-    if eth_price > ETH_CLOSE:
-        return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
-    return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
 
 async def send_tg(text: str, chat_id: Optional[str] = None):
     if not SEND_ENABLED: return
@@ -115,16 +126,17 @@ async def log_action(action: str, details: dict):
     async with pool.acquire() as c:
         await c.execute("INSERT INTO actions_log(action, details) VALUES($1,$2)", action, json.dumps(details))
 
+def action_line(eth_price: float) -> str:
+    if eth_price < ETH_HEDGE_2:
+        return f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH)."
+    if eth_price < ETH_HEDGE_1:
+        return f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH)."
+    if eth_price > ETH_CLOSE:
+        return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
+    return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
+
 # ---------- Market fetch with fallbacks ----------
 async def get_spot_snapshot() -> dict:
-    """
-    Retorna dict:
-    {
-      'eth': {'price':float,'high':float|None,'low':float|None},
-      'btc': {...}
-    }
-    Ordem: Bybit -> Binance -> CoinGecko
-    """
     # 1) Bybit
     try:
         eth = (await fetch_json(BYBIT_SPOT.format(sym="ETHUSDT")))["result"]["list"][0]
@@ -151,7 +163,7 @@ async def get_spot_snapshot() -> dict:
         print("[WARN] Binance spot falhou:", repr(e))
         traceback.print_exc()
 
-    # 3) CoinGecko (somente preço)
+    # 3) CoinGecko (só preço)
     try:
         cg = await fetch_json(COINGECKO_SIMPLE)
         return {
@@ -178,7 +190,98 @@ async def get_derivatives_snapshot() -> dict:
         print("[WARN] OI Bybit falhou:", repr(e))
     return {"funding": funding, "oi": open_interest}
 
-# ---------- Ingestão 1m ----------
+# ---------- Bybit private (read-only) ----------
+BYBIT_API = "https://api.bybit.com"
+def bybit_signature(secret: str, payload: Dict[str, Any]) -> str:
+    # assinatura v5: concatena query em ordem de chave
+    qs = "&".join([f"{k}={payload[k]}" for k in sorted(payload)])
+    return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
+
+async def bybit_private_get(path: str, query: Dict[str, Any]) -> Dict[str, Any]:
+    if not (BYBIT_KEY and BYBIT_SEC):
+        raise RuntimeError("Bybit RO vars não definidas")
+    ts = str(int(time.time() * 1000))
+    payload = {
+        "api_key": BYBIT_KEY,
+        "timestamp": ts,
+        "recv_window": "5000",
+        **query
+    }
+    sign = bybit_signature(BYBIT_SEC, payload)
+    headers = {"X-BAPI-API-KEY": BYBIT_KEY, "X-BAPI-SIGN": sign, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": "5000"}
+    url = f"{BYBIT_API}{path}?"+ "&".join([f"{k}={payload[k]}" for k in sorted(payload)])
+    async with httpx.AsyncClient(timeout=15) as s:
+        r = await s.get(url, headers=headers)
+        r.raise_for_status()
+        return r.json()
+
+async def snapshot_bybit() -> List[Dict[str, Any]]:
+    """Equity/margem básicas (unified). Salva métricas simples."""
+    metrics = []
+    try:
+        # wallet balance (unified)
+        r = await bybit_private_get("/v5/account/wallet-balance", {"accountType": "UNIFIED"})
+        lst = r.get("result", {}).get("list", [])
+        if lst:
+            total_equity = float(lst[0].get("totalEquity", 0.0))
+            metrics.append(("bybit", "total_equity", total_equity))
+        # positions (ETHUSDT perp)
+        r2 = await bybit_private_get("/v5/position/list", {"category": "linear", "symbol": "ETHUSDT"})
+        pos = r2.get("result", {}).get("list", [])
+        if pos:
+            size = float(pos[0].get("size", 0.0))
+            leverage = float(pos[0].get("leverage", 0.0) or 0.0)
+            metrics.append(("bybit", "ethusdt_perp_size", size))
+            metrics.append(("bybit", "ethusdt_perp_leverage", leverage))
+    except Exception as e:
+        print("[WARN] snapshot_bybit falhou:", repr(e))
+    return [{"venue": v, "metric": m, "value": val} for (v, m, val) in metrics]
+
+# ---------- Aave (via subgraph simples) ----------
+AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
+AAVE_QUERY = """
+query ($user: String!) {
+  userReserves(where: { user: $user }) {
+    reserve { symbol, decimals }
+    scaledATokenBalance
+    scaledVariableDebt
+  }
+}
+"""
+async def snapshot_aave() -> List[Dict[str, Any]]:
+    if not AAVE_ADDR:
+        return []
+    out = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as s:
+            r = await s.post(AAVE_SUBGRAPH, json={"query": AAVE_QUERY, "variables": {"user": AAVE_ADDR.lower()}})
+            r.raise_for_status()
+            data = r.json()
+        # cálculo simplificado (sem índices de liquidez) — usamos como tendência, não valor absoluto
+        reserves = data.get("data", {}).get("userReserves", [])
+        total_coll = 0.0; total_debt = 0.0
+        for it in reserves:
+            sym = it["reserve"]["symbol"]; dec = int(it["reserve"]["decimals"])
+            a = float(it["scaledATokenBalance"] or 0) / (10**dec)
+            d = float(it["scaledVariableDebt"] or 0) / (10**dec)
+            if a > 0: total_coll += a  # proxy
+            if d > 0: total_debt += d
+        out.append({"venue":"aave","metric":"collateral_proxy","value": total_coll})
+        out.append({"venue":"aave","metric":"debt_proxy","value": total_debt})
+    except Exception as e:
+        print("[WARN] snapshot_aave falhou:", repr(e))
+    return out
+
+async def save_account_metrics(rows: List[Dict[str, Any]]):
+    if not rows: return
+    async with pool.acquire() as c:
+        for r in rows:
+            await c.execute(
+                "INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)",
+                r["venue"], r["metric"], r["value"]
+            )
+
+# ---------- Ingestões ----------
 async def ingest_1m():
     now = dt.datetime.now(dt.UTC).replace(second=0, microsecond=0)
     spot = await get_spot_snapshot()
@@ -219,6 +322,16 @@ async def ingest_1m():
             now, "ETHUSDT", "bybit", der["funding"], der["oi"]
         )
 
+async def ingest_accounts():
+    rows: List[Dict[str, Any]] = []
+    # Bybit RO
+    if BYBIT_KEY and BYBIT_SEC:
+        rows += await snapshot_bybit()
+    # Aave
+    if AAVE_ADDR:
+        rows += await snapshot_aave()
+    await save_account_metrics(rows)
+
 # ---------- Texto do panorama ----------
 async def latest_pulse_text() -> str:
     async with pool.acquire() as c:
@@ -235,8 +348,8 @@ async def latest_pulse_text() -> str:
     oi = d["open_interest"] if d else None
     lines = [
         f"🕒 {now}",
-        f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if (eh is not None and not math.isnan(float(eh))) else ""),
-        f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if (bh is not None and not math.isnan(float(bh))) else ""),
+        f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if (eh is not None and not (isinstance(eh,float) and math.isnan(eh))) else ""),
+        f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if (bh is not None and not (isinstance(bh,float) and math.isnan(bh))) else ""),
         f"ETH/BTC: {ratio:.5f}",
     ]
     if funding is not None: lines.append(f"Funding (ETH): {float(funding)*100:.3f}%/8h")
@@ -244,11 +357,21 @@ async def latest_pulse_text() -> str:
     lines.append(action_line(eth))
     return "\n".join(lines)
 
+async def send_pulse_to_chat():
+    text = await latest_pulse_text()
+    await send_tg(text)
+
 # ---------- Rotas ----------
 @app.on_event("startup")
 async def _startup():
     await db_init()
+    # Ingestões
     scheduler.add_job(ingest_1m, "interval", minutes=1, id="ingest_1m", replace_existing=True)
+    scheduler.add_job(ingest_accounts, "interval", minutes=5, id="ingest_accounts", replace_existing=True)
+    # Boletins automáticos: 08:00, 14:00 e 20:00 (America/Sao_Paulo)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
     scheduler.start()
 
 @app.get("/healthz")
@@ -261,7 +384,6 @@ async def pulse():
     await send_tg(text)
     return {"ok": True, "message": text}
 
-# --- Telegram webhook + comandos de memória ---
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
     try:
@@ -274,18 +396,15 @@ async def telegram_webhook(request: Request):
 
     chat_id = str(msg["chat"]["id"])
     text = (msg.get("text") or "").strip()
-
     low = text.lower()
+
     if low in ("/start", "start"):
-        await send_tg("✅ Bot online. Use /pulse para panorama.\nComandos: /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id)
+        await send_tg("✅ Bot online. Comandos: /pulse, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id)
         return {"ok": True}
 
     if low == "/pulse":
-        panorama = await latest_pulse_text()
-        await send_tg(panorama, chat_id)
-        return {"ok": True}
+        await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
 
-    # /note <texto>
     if low.startswith("/note"):
         note = text[len("/note"):].strip()
         if not note:
@@ -293,10 +412,8 @@ async def telegram_webhook(request: Request):
         async with pool.acquire() as c:
             await c.execute("INSERT INTO notes(tag,text) VALUES($1,$2)", None, note)
         await log_action("note_add", {"text": note})
-        await send_tg("📝 Nota salva.", chat_id)
-        return {"ok": True}
+        await send_tg("📝 Nota salva.", chat_id); return {"ok": True}
 
-    # /strat new <nome> | <versão> | <nota>
     if low.startswith("/strat new"):
         try:
             payload = text[len("/strat new"):].strip()
@@ -306,8 +423,7 @@ async def telegram_webhook(request: Request):
         async with pool.acquire() as c:
             await c.execute("INSERT INTO strategy_versions(name,version,note) VALUES($1,$2,$3)", name, version, note)
         await log_action("strat_new", {"name": name, "version": version})
-        await send_tg(f"📌 Estratégia salva: {name} v{version}", chat_id)
-        return {"ok": True}
+        await send_tg(f"📌 Estratégia salva: {name} v{version}", chat_id); return {"ok": True}
 
     if low == "/strat last":
         async with pool.acquire() as c:
@@ -327,6 +443,37 @@ async def telegram_webhook(request: Request):
             out.append(f"- {r['created_at']:%m-%d %H:%M} • {r['text']}")
         await send_tg("\n".join(out), chat_id); return {"ok": True}
 
-    # fallback
     await send_tg("Comando não reconhecido. Use /pulse, /note, /strat new, /strat last, /notes.", chat_id)
     return {"ok": True}
+
+# ---------- Exports ----------
+@app.get("/export/notes.csv")
+async def export_notes():
+    async with pool.acquire() as c:
+        rows = await c.fetch("SELECT created_at, tag, text FROM notes ORDER BY id DESC")
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["created_at","tag","text"])
+    for r in rows:
+        w.writerow([r["created_at"].isoformat(), r["tag"] or "", r["text"]])
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv")
+
+@app.get("/export/strats.csv")
+async def export_strats():
+    async with pool.acquire() as c:
+        rows = await c.fetch("SELECT created_at, name, version, note FROM strategy_versions ORDER BY id DESC")
+    buf = io.StringIO(); w = csv.writer(buf)
+    w.writerow(["created_at","name","version","note"])
+    for r in rows:
+        w.writerow([r["created_at"].isoformat(), r["name"], r["version"], r["note"] or ""])
+    return PlainTextResponse(buf.getvalue(), media_type="text/csv")
+
+@app.get("/accounts/last")
+async def accounts_last():
+    async with pool.acquire() as c:
+        rows = await c.fetch("""
+            SELECT * FROM account_snap
+            WHERE ts > now() - interval '1 hour'
+            ORDER BY ts DESC, venue, metric
+        """)
+    data = [dict(r) for r in rows]
+    return JSONResponse({"rows": data})
