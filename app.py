@@ -1,8 +1,11 @@
-# app.py — Stark DeFi Agent v5.3 (anti-rate-limit + intervals via ENV)
-# Mantém: /pulse, /status, /run/accounts, Telegram, Bybit priv., Aave subgraph,
-# notes/strats CSV, hedge hints. Corrige 403/429 com retry/backoff.
+# app.py — Stark DeFi Agent v5.3.2
+# - Headers + backoff (evita 403/429 em Bybit/CoinGecko)
+# - Fallbacks: Bybit -> Binance -> Coinbase/Kraken/CG
+# - Whales com fallback Binance e chave WHALES_ENABLED
+# - /status com counts + last_run; /pulse com comentário 6–8h
+# - Agendas 08/14/20; /run/accounts; export CSV; Aave proxy
 
-import os, hmac, hashlib, time, math, csv, io, asyncio, random, traceback
+import os, hmac, hashlib, time, math, csv, io, asyncio, traceback
 import datetime as dt
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List
@@ -11,62 +14,63 @@ import httpx
 import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-APP_NAME = "stark-defi-agent"
-APP_VERSION = "5.3"
+# ---------- ENV ----------
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
-
 DB_URL = os.getenv("DATABASE_URL")
 
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-SEND_ENABLED = bool(TG_TOKEN and TG_CHAT)
+SEND_ENABLED = bool(TG_TOKEN)
 
-# Bybit (read-only)
 BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
 BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
 BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 
-# Aave / Etherscan
-AAVE_ADDR = os.getenv("AAVE_ADDR", "")
+AAVE_ADDR = os.getenv("AAVE_ADDR", "")              # EVM (0x...)
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
-# Hedge params
 ETH_HEDGE_1 = float(os.getenv("ETH_HEDGE_1", "3900"))
 ETH_HEDGE_2 = float(os.getenv("ETH_HEDGE_2", "3800"))
 ETH_CLOSE   = float(os.getenv("ETH_CLOSE_HEDGE", "3950"))
+
 WHALE_USD_MIN = float(os.getenv("WHALE_USD_MIN", "500000"))
+WHALES_ENABLED = os.getenv("WHALES_ENABLED", "true").lower() not in ("0","false","no")
 
-# intervals via ENV (segundos)
-MARKET_INTERVAL_SEC   = int(os.getenv("MARKET_INTERVAL_SEC", "120"))  # mais suave
-WHALES_INTERVAL_SEC   = int(os.getenv("WHALES_INTERVAL_SEC", "60"))
-ACCOUNTS_INTERVAL_SEC = int(os.getenv("ACCOUNTS_INTERVAL_SEC", "300"))
-ONCHAIN_INTERVAL_SEC  = int(os.getenv("ONCHAIN_INTERVAL_SEC", "300"))
-
-# Endpoints
+# Endpoints públicos
 BYBIT_API = "https://api.bybit.com"
-BYBIT_SPOT = BYBIT_API + "/v5/market/tickers?category=spot&symbol={sym}"
-BYBIT_RECENT_TRADES = BYBIT_API + "/v5/market/recent-trade?category=linear&symbol=ETHUSDT&limit=1000"
-BYBIT_FUND = BYBIT_API + "/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
-BYBIT_OI   = BYBIT_API + "/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
+BYBIT_SPOT_QS = "/v5/market/tickers"                 # params: category, symbol
+BYBIT_RECENT_TRADES = "/v5/market/recent-trade"      # params: category, symbol, limit
+BYBIT_FUND = "https://api.bybit.com/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
+BYBIT_OI   = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
 
+# Fallbacks
+BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
+BINANCE_AGG = "https://api.binance.com/api/v3/aggTrades"
+COINBASE_TICK = "https://api.exchange.coinbase.com/products/{pair}/ticker"
 COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
-ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
+
+# Telegram
 TG_SEND = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
-# -------------------------------------------------------------------------------------
-# App, pool e scheduler
-# -------------------------------------------------------------------------------------
-app = FastAPI(title=APP_NAME, version=APP_VERSION)
+# Etherscan
+ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
+
+# ---------- APP ----------
+app = FastAPI(title="stark-defi-agent", version="5.3.2")
 pool: Optional[asyncpg.Pool] = None
+
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 scheduler = AsyncIOScheduler(timezone=str(TZ))
 
-last_run = { "ingest_1m": None, "ingest_whales": None, "ingest_accounts": None, "ingest_onchain": None }
+last_run = {
+    "ingest_1m": None,
+    "ingest_whales": None,
+    "ingest_accounts": None,
+    "ingest_onchain": None,
+}
 
-# -------------------------------------------------------------------------------------
-# SQL
-# -------------------------------------------------------------------------------------
+# ---------- DB ----------
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS candles_minute(
   ts timestamptz NOT NULL,
@@ -121,23 +125,46 @@ CREATE TABLE IF NOT EXISTS whale_events(
 );
 """
 
-# -------------------------------------------------------------------------------------
-# Utils
-# -------------------------------------------------------------------------------------
+async def db_init():
+    if not DB_URL:
+        raise RuntimeError("DATABASE_URL não definido.")
+    global pool
+    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
+    async with pool.acquire() as c:
+        await c.execute(CREATE_SQL)
+
+# ---------- HTTP helpers ----------
 DEFAULT_HEADERS = {
-    "User-Agent": f"{APP_NAME}/{APP_VERSION} (+bot)",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Connection": "keep-alive",
 }
+
+async def fetch_json_retry(url: str, *, params: Dict[str, str] | None = None,
+                           headers: Dict[str, str] | None = None,
+                           tries: int = 4, base_delay: float = 0.6):
+    hdrs = {**DEFAULT_HEADERS, **(headers or {})}
+    last_exc = None
+    for i in range(tries):
+        try:
+            async with httpx.AsyncClient(timeout=20) as s:
+                r = await s.get(url, params=params, headers=hdrs)
+                # Retentativa em 403/429/5xx comuns
+                if r.status_code in (403, 429, 502, 503):
+                    raise httpx.HTTPStatusError("retryable", request=r.request, response=r)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(base_delay * (2 ** i) + 0.1 * i)
+    raise last_exc
 
 async def send_tg(text: str, chat_id: Optional[str] = None):
     if not SEND_ENABLED: return
     cid = chat_id or TG_CHAT
     if not cid: return
-    try:
-        async with httpx.AsyncClient(timeout=12) as s:
-            await s.post(TG_SEND, json={"chat_id": cid, "text": text})
-    except Exception:
-        pass
+    async with httpx.AsyncClient(timeout=12) as s:
+        await s.post(TG_SEND, json={"chat_id": cid, "text": text})
 
 def action_line(eth_price: float) -> str:
     if eth_price < ETH_HEDGE_2:
@@ -148,69 +175,47 @@ def action_line(eth_price: float) -> str:
         return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
     return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
 
-# Retry/Backoff
-async def fetch_json_retry(url: str, *, headers=None, params=None,
-                           retries: int = 5, base_delay: float = 0.8, max_delay: float = 10.0):
-    hdrs = dict(DEFAULT_HEADERS)
-    if headers: hdrs.update(headers)
-    delay = base_delay
-    last_exc = None
-    for attempt in range(1, retries+1):
-        try:
-            async with httpx.AsyncClient(timeout=20) as s:
-                r = await s.get(url, headers=hdrs, params=params)
-                # 403/429/5xx: tratar
-                if r.status_code in (403, 429) or 500 <= r.status_code < 600:
-                    ra = r.headers.get("Retry-After")
-                    wait = float(ra) if (ra and ra.isdigit()) else min(max_delay, delay * (1.6 + random.random()*0.4))
-                    await asyncio.sleep(wait)
-                    delay = min(max_delay, delay * 1.8)
-                    last_exc = httpx.HTTPStatusError(f"{r.status_code} {r.reason_phrase}", request=r.request, response=r)
-                    continue
-                r.raise_for_status()
-                return r.json()
-        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout) as e:
-            last_exc = e
-            await asyncio.sleep(min(max_delay, delay))
-            delay = min(max_delay, delay * 1.8)
-    if last_exc: raise last_exc
-    raise RuntimeError("fetch_json_retry: exhausted retries")
-
-# DB
-async def db_init():
-    if not DB_URL:
-        raise RuntimeError("DATABASE_URL não definido.")
-    global pool
-    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=5)
-    async with pool.acquire() as c:
-        await c.execute(CREATE_SQL)
-
-# -------------------------------------------------------------------------------------
-# Market snapshots
-# -------------------------------------------------------------------------------------
+# ---------- Market snapshots ----------
 async def get_spot_snapshot() -> dict:
-    # Tenta Bybit com header de key (mesmo público). Se 403/erro, cai para CoinGecko.
-    bybit_headers = {
-        "X-BAPI-API-KEY": BYBIT_KEY or "",
-        "Referer": "https://bybit.com",
-    }
+    # Bybit tenta domínios alternativos primeiro
+    for dom in ("https://api.bybitglobal.com", "https://api.bybit.com"):
+        try:
+            eth = (await fetch_json_retry(f"{dom}{BYBIT_SPOT_QS}",
+                                          params={"category":"linear","symbol":"ETHUSDT"}))["result"]["list"][0]
+            btc = (await fetch_json_retry(f"{dom}{BYBIT_SPOT_QS}",
+                                          params={"category":"linear","symbol":"BTCUSDT"}))["result"]["list"][0]
+            return {
+                "eth": {"price": float(eth["lastPrice"]), "high": float(eth["highPrice"]), "low": float(eth["lowPrice"])},
+                "btc": {"price": float(btc["lastPrice"]), "high": float(btc["highPrice"]), "low": float(btc["lowPrice"])},
+            }
+        except Exception:
+            continue
+    # Binance
     try:
-        eth = (await fetch_json_retry(BYBIT_SPOT.format(sym="ETHUSDT"), headers=bybit_headers))["result"]["list"][0]
-        btc = (await fetch_json_retry(BYBIT_SPOT.format(sym="BTCUSDT"), headers=bybit_headers))["result"]["list"][0]
+        be = await fetch_json_retry(BINANCE_24H, params={"symbol":"ETHUSDT"})
+        bb = await fetch_json_retry(BINANCE_24H, params={"symbol":"BTCUSDT"})
         return {
-            "eth": {"price": float(eth["lastPrice"]), "high": float(eth["highPrice"]), "low": float(eth["lowPrice"])},
-            "btc": {"price": float(btc["lastPrice"]), "high": float(btc["highPrice"]), "low": float(btc["lowPrice"])},
+            "eth": {"price": float(be["lastPrice"]), "high": float(be["highPrice"]), "low": float(be["lowPrice"])},
+            "btc": {"price": float(bb["lastPrice"]), "high": float(bb["highPrice"]), "low": float(bb["lowPrice"])},
         }
     except Exception:
-        # Fallback: CoinGecko (com retry/backoff)
-        cg = await fetch_json_retry(
-            COINGECKO_SIMPLE,
-            params={"ids":"ethereum,bitcoin","vs_currencies":"usd"},
-        )
+        pass
+    # Coinbase
+    try:
+        ce = await fetch_json_retry(COINBASE_TICK.format(pair="ETH-USD"))
+        cb = await fetch_json_retry(COINBASE_TICK.format(pair="BTC-USD"))
         return {
-            "eth": {"price": float(cg["ethereum"]["usd"]), "high": math.nan, "low": math.nan},
-            "btc": {"price": float(cg["bitcoin"]["usd"]),  "high": math.nan, "low": math.nan},
+            "eth": {"price": float(ce["price"]), "high": math.nan, "low": math.nan},
+            "btc": {"price": float(cb["price"]), "high": math.nan, "low": math.nan},
         }
+    except Exception:
+        pass
+    # Coingecko (último recurso)
+    cg = await fetch_json_retry(COINGECKO_SIMPLE, params={"ids":"ethereum,bitcoin","vs_currencies":"usd"})
+    return {
+        "eth": {"price": float(cg["ethereum"]["usd"]), "high": math.nan, "low": math.nan},
+        "btc": {"price": float(cg["bitcoin"]["usd"]),  "high": math.nan, "low": math.nan},
+    }
 
 async def get_derivatives_snapshot() -> dict:
     funding = None; open_interest = None
@@ -231,13 +236,10 @@ async def ingest_1m():
         now = dt.datetime.now(dt.UTC).replace(second=0, microsecond=0)
         spot = await get_spot_snapshot()
         der  = await get_derivatives_snapshot()
-
         eth_p = spot["eth"]["price"]; btc_p = spot["btc"]["price"]
         eth_h = spot["eth"]["high"];  eth_l = spot["eth"]["low"]
         btc_h = spot["btc"]["high"];  btc_l = spot["btc"]["low"]
-
-        ethbtc = (eth_p / btc_p) if (btc_p and not math.isnan(btc_p)) else math.nan
-
+        ethbtc = eth_p / btc_p
         async with pool.acquire() as c:
             await c.execute(
                 "INSERT INTO candles_minute(ts,symbol,open,high,low,close,volume) VALUES($1,$2,NULL,$3,$4,$5,NULL) "
@@ -262,17 +264,32 @@ async def ingest_1m():
     finally:
         last_run["ingest_1m"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# -------------------------------------------------------------------------------------
-# Whales (agg de recentes)
-# -------------------------------------------------------------------------------------
+# ---------- Whales ----------
 _last_trade_time_ms = 0
 _ws_lock = asyncio.Lock()
 
 async def ingest_whales():
+    if not WHALES_ENABLED:
+        last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
+        return
     global _last_trade_time_ms
     try:
         async with _ws_lock:
-            data = (await fetch_json_retry(BYBIT_RECENT_TRADES))["result"]["list"]
+            # 1) Bybit
+            data = None
+            for dom in ("https://api.bybitglobal.com", "https://api.bybit.com"):
+                try:
+                    r = await fetch_json_retry(f"{dom}{BYBIT_RECENT_TRADES}",
+                                               params={"category":"linear","symbol":"ETHUSDT","limit":"1000"})
+                    data = r["result"]["list"]; break
+                except Exception:
+                    continue
+            # 2) Binance fallback
+            if data is None:
+                agg = await fetch_json_retry(BINANCE_AGG, params={"symbol":"ETHUSDT","limit":"1000"})
+                data = [{"time": int(t["T"]), "price": t["p"], "qty": t["q"],
+                         "side": "BUY" if t.get("m")==False else "SELL"} for t in agg]
+
             new = [t for t in data if int(t.get("time", 0)) > _last_trade_time_ms]
             if not new: return
             _last_trade_time_ms = max(int(t.get("time", 0)) for t in new)
@@ -280,7 +297,7 @@ async def ingest_whales():
             buy_usd=sell_usd=0.0; buy_qty=sell_qty=0.0
             for t in new:
                 price=float(t["price"]); qty=float(t["qty"])
-                side=(t["side"] or "").upper()
+                side=(t.get("side") or "").upper()
                 usd=price*qty
                 if side=="BUY":  buy_usd+=usd; buy_qty+=qty
                 else:            sell_usd+=usd; sell_qty+=qty
@@ -294,16 +311,14 @@ async def ingest_whales():
                     for side, qty, usd, note in events:
                         await c.execute(
                             "INSERT INTO whale_events(ts,venue,side,qty,usd_value,note) VALUES($1,$2,$3,$4,$5,$6)",
-                            ts, "bybit", side, qty, usd, note
+                            ts, "perp", side, qty, usd, note
                         )
                 for side, qty, usd, note in events:
                     await send_tg(f"🐋 {side} ~ ${usd:,.0f} | qty ~ {qty:,.1f} | {note}")
     finally:
         last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# -------------------------------------------------------------------------------------
-# Bybit private + Aave snapshots (conta)
-# -------------------------------------------------------------------------------------
+# ---------- Accounts ----------
 def bybit_sign_qs(secret: str, params: Dict[str, Any]) -> str:
     qs = "&".join([f"{k}={params[k]}" for k in sorted(params)])
     return hmac.new(secret.encode(), qs.encode(), hashlib.sha256).hexdigest()
@@ -339,6 +354,7 @@ async def snapshot_bybit() -> List[Dict[str, Any]]:
         traceback.print_exc()
     return out
 
+# Aave via subgraph (proxy simples)
 AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
 AAVE_QUERY = """
 query ($user: String!) {
@@ -380,11 +396,9 @@ async def ingest_accounts():
             await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
     last_run["ingest_accounts"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# -------------------------------------------------------------------------------------
-# On-chain opcional (Etherscan)
-# -------------------------------------------------------------------------------------
+# ---------- On-chain opcional ----------
 async def ingest_onchain_eth(addr: str):
-    if not ETHERSCAN_API_KEY: 
+    if not ETHERSCAN_API_KEY:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
         return
     try:
@@ -408,9 +422,7 @@ async def ingest_onchain_eth(addr: str):
     finally:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# -------------------------------------------------------------------------------------
-# Comentário 6–8h e Pulse
-# -------------------------------------------------------------------------------------
+# ---------- Comentário 6–8h ----------
 async def build_commentary() -> str:
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=8)
     async with pool.acquire() as c:
@@ -453,28 +465,22 @@ async def latest_pulse_text() -> str:
     if d and d["funding"] is not None: parts.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
     if d and d["open_interest"] is not None: parts.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
     # ação
-    if eth < ETH_HEDGE_2: parts.append(f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH).")
-    elif eth < ETH_HEDGE_1: parts.append(f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH).")
-    elif eth > ETH_CLOSE: parts.append(f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge.")
-    else: parts.append("✅ Sem gatilho imediato.")
+    parts.append(action_line(eth))
     comment = await build_commentary()
     return "\n".join(parts) + "\n\n" + comment
 
 async def send_pulse_to_chat():
     await send_tg(await latest_pulse_text())
 
-# -------------------------------------------------------------------------------------
-# FastAPI
-# -------------------------------------------------------------------------------------
+# ---------- FastAPI ----------
 @app.on_event("startup")
 async def _startup():
     await db_init()
-    scheduler.add_job(ingest_1m, "interval", seconds=MARKET_INTERVAL_SEC, id="ingest_1m", replace_existing=True)
-    scheduler.add_job(ingest_whales, "interval", seconds=WHALES_INTERVAL_SEC, id="ingest_whales", replace_existing=True)
-    scheduler.add_job(ingest_accounts, "interval", seconds=ACCOUNTS_INTERVAL_SEC, id="ingest_accounts", replace_existing=True)
+    scheduler.add_job(ingest_1m, "interval", minutes=1, id="ingest_1m", replace_existing=True)
+    scheduler.add_job(ingest_whales, "interval", seconds=30, id="ingest_whales", replace_existing=True)
+    scheduler.add_job(ingest_accounts, "interval", minutes=5, id="ingest_accounts", replace_existing=True)
     if AAVE_ADDR and ETHERSCAN_API_KEY:
-        scheduler.add_job(ingest_onchain_eth, "interval", seconds=ONCHAIN_INTERVAL_SEC, args=[AAVE_ADDR], id="ingest_onchain", replace_existing=True)
-    # boletins
+        scheduler.add_job(ingest_onchain_eth, "interval", minutes=5, args=[AAVE_ADDR], id="ingest_onchain", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
@@ -514,8 +520,10 @@ async def pulse():
 
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    try: update = await request.json()
-    except Exception: return {"ok": True}
+    try:
+        update = await request.json()
+    except Exception:
+        return {"ok": True}
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
     if not msg: return {"ok": True}
     chat_id = str(msg["chat"]["id"])
@@ -572,12 +580,6 @@ async def export_strats():
     for r in rows: w.writerow([r["created_at"].isoformat(), r["name"], r["version"], r["note"] or ""])
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
-@app.get("/accounts/last")
-async def accounts_last():
-    async with pool.acquire() as c:
-        rows = await c.fetch("""
-            SELECT * FROM account_snap
-            WHERE ts > now() - interval '1 hour'
-            ORDER BY ts DESC, venue, metric
-        """)
-    return JSONResponse({"rows": [dict(r) for r in rows]})
+@app.get("/")
+async def root():
+    return {"ok": True, "service": "stark-defi-agent", "version": "5.3.2"}
