@@ -1,23 +1,21 @@
-# app.py — Stark DeFi Agent v5.7 (2025-08-10)
-# Mantém v5.1 e adiciona:
-# - /pulse e /alfa com comentário de 6–8h (preço, derivativos, whales, temas de notícia)
-# - Corrigido /eth e /btc (sem duplicar)
-# - Fallbacks de preço (Coinbase) e news via RSS
-# - Whales por Bybit (recent-trade) e fallback Coinbase /trades
-# - Webhook aceita /webhook e /webhook/<TOKEN>
+# app.py — Stark DeFi Agent v5.7.1
+# - Anti-spam de baleias: cooldown + Coinbase só alerta se muito grande
+# - Coleta robusta de preços (Coinbase fallback) e derivativos (Bybit)
+# - Ingest de notícias (RSS), classificação de temas e comentário inteligente no /pulse
+# - Mesma API da v5.x com melhorias
+# ---------------------------------------------------------------
 
-import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, json
+import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, re
 import datetime as dt
 from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
-import xml.etree.ElementTree as ET
 
 import httpx
 import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-# ====== ENV ======
+# --------- Config base
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
 DB_URL = os.getenv("DATABASE_URL")
 
@@ -38,36 +36,49 @@ ETH_CLOSE   = float(os.getenv("ETH_CLOSE_HEDGE", "3950"))
 
 WHALE_USD_MIN = float(os.getenv("WHALE_USD_MIN", "500000"))
 
-# Notícias (se quiser customizar, defina NEWS_SOURCES separado por vírgula)
-NEWS_SOURCES = os.getenv(
-    "NEWS_SOURCES",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml,"
-    "https://cointelegraph.com/rss,"
-    "https://www.theblock.co/rss.xml"
-).split(",")
+# Anti-ruído e controle de whales
+WHALE_COOLDOWN_SEC = int(os.getenv("WHALE_COOLDOWN_SEC", "600"))          # 10 min
+COINBASE_MIN_ALERT_USD = float(os.getenv("COINBASE_MIN_ALERT_USD", "2000000"))
+WHALE_SOURCE = os.getenv("WHALE_SOURCE", "auto").lower()                  # auto|bybit|coinbase
+WHALE_ALERTS_ENABLED = os.getenv("WHALE_ALERTS_ENABLED", "on").lower() in ("on","1","true")
 
-# ====== URLs ======
+# Notícias
+NEWS_SOURCES = [s.strip() for s in os.getenv("NEWS_SOURCES", "coindesk,cointelegraph").split(",") if s.strip()]
+NEWS_WINDOW_H = int(os.getenv("NEWS_WINDOW_H", "12"))
+NEWS_MAX_ITEMS = int(os.getenv("NEWS_MAX_ITEMS", "20"))
+
+# --------- Constantes de API
 BYBIT_PUBLIC = "https://api.bybit.com"
-BYBIT_GLOBAL = "https://api.bybitglobal.com"  # fallback
-BYBIT_SPOT = f"{BYBIT_PUBLIC}/v5/market/tickers?category=spot&symbol={{sym}}"
-BYBIT_LINEAR = f"{BYBIT_PUBLIC}/v5/market/tickers?category=linear&symbol={{sym}}"
-BYBIT_RECENT_TRADES = f"{BYBIT_PUBLIC}/v5/market/recent-trade?category=linear&symbol=ETHUSDT&limit=1000"
-BYBIT_FUND = f"{BYBIT_PUBLIC}/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
-BYBIT_OI   = f"{BYBIT_PUBLIC}/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
+BYBIT_PUBLIC_ALT = "https://api.bybitglobal.com"
+BYBIT_SPOT = BYBIT_PUBLIC + "/v5/market/tickers?category=spot&symbol={sym}"
+BYBIT_FUND = BYBIT_PUBLIC + "/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
+BYBIT_OI   = BYBIT_PUBLIC + "/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
+BYBIT_RECENT_TRADES = BYBIT_PUBLIC + "/v5/market/recent-trade?category=linear&symbol=ETHUSDT&limit=1000"
 
-COINBASE_TICKER = "https://api.exchange.coinbase.com/products/{prod}/ticker"      # prod=ETH-USD/BTC-USD
-COINBASE_TRADES = "https://api.exchange.coinbase.com/products/{prod}/trades"      # trades for whales fallback
+COINBASE_TICKER = "https://api.exchange.coinbase.com/products/{prod}/ticker"
+COINBASE_TRADES = "https://api.exchange.coinbase.com/products/{prod}/trades"
+BINANCE_24H     = "https://api.binance.com/api/v3/ticker/24hr?symbol={sym}"
+BINANCE_AGG     = "https://api.binance.com/api/v3/aggTrades?symbol={sym}&limit=1000"
 
 TG_SEND = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
 
 ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
 
-# ====== APP / POOL ======
-app = FastAPI(title="stark-defi-agent", version="5.7")
+# RSS
+RSS = {
+    "coindesk": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "cointelegraph": "https://cointelegraph.com/rss",
+}
+
+# --------- App & DB
+app = FastAPI(title="stark-defi-agent")
 pool: Optional[asyncpg.Pool] = None
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 scheduler = AsyncIOScheduler(timezone=str(TZ))
+
+def now_local_iso():
+    return dt.datetime.now(TZ).isoformat(timespec="seconds")
 
 last_run = {
     "ingest_1m": None,
@@ -77,7 +88,6 @@ last_run = {
     "news": None,
 }
 
-# ====== SQL ======
 CREATE_SQL = """
 CREATE TABLE IF NOT EXISTS candles_minute(
   ts timestamptz NOT NULL,
@@ -116,7 +126,6 @@ CREATE TABLE IF NOT EXISTS actions_log(
   details jsonb
 );
 CREATE TABLE IF NOT EXISTS account_snap(
-  id serial PRIMARY KEY,
   ts timestamptz NOT NULL DEFAULT now(),
   venue text NOT NULL,
   metric text NOT NULL,
@@ -131,18 +140,16 @@ CREATE TABLE IF NOT EXISTS whale_events(
   usd_value numeric,
   note text
 );
-CREATE TABLE IF NOT EXISTS news(
-  id serial PRIMARY KEY,
-  ts timestamptz NOT NULL,
+CREATE TABLE IF NOT EXISTS news_items(
+  id bigserial PRIMARY KEY,
+  ts_ingested timestamptz NOT NULL DEFAULT now(),
+  ts_pub timestamptz,
   source text NOT NULL,
   title text NOT NULL,
-  url text
+  url text NOT NULL,
+  themes text
 );
 """
-
-# ====== UTILS ======
-def now_local_iso():
-    return dt.datetime.now(TZ).isoformat(timespec="seconds")
 
 async def db_init():
     if not DB_URL:
@@ -152,40 +159,43 @@ async def db_init():
     async with pool.acquire() as c:
         await c.execute(CREATE_SQL)
 
+# --------- HTTP helpers
+_DEFAULT_HEADERS = {
+    "User-Agent": "stark-defi-agent/5.7.1 (+https://starkradar-bot.onrender.com)"
+}
+
 async def fetch_json(url: str, headers: Dict[str,str]|None=None, params: Dict[str,str]|None=None):
-    async with httpx.AsyncClient(timeout=15) as s:
+    async with httpx.AsyncClient(timeout=20, headers={**_DEFAULT_HEADERS, **(headers or {})}) as s:
         r = await s.get(url, headers=headers, params=params)
         r.raise_for_status()
         return r.json()
 
+async def fetch_json_retry(url: str, params: Dict[str,str]|None=None, tries: int = 3, backoff: float = 0.8):
+    last_exc = None
+    for i in range(tries):
+        try:
+            async with httpx.AsyncClient(timeout=20, headers=_DEFAULT_HEADERS) as s:
+                r = await s.get(url, params=params)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            last_exc = e
+            await asyncio.sleep(backoff * (i+1))
+    raise last_exc
+
 async def fetch_text(url: str):
-    async with httpx.AsyncClient(timeout=20) as s:
+    async with httpx.AsyncClient(timeout=20, headers=_DEFAULT_HEADERS) as s:
         r = await s.get(url)
         r.raise_for_status()
         return r.text
 
-async def fetch_json_retry(url: str, *, headers=None, params=None, tries:int=3, sleep:float=0.6):
-    last_exc=None
-    for i in range(tries):
-        try:
-            async with httpx.AsyncClient(timeout=15) as s:
-                r = await s.get(url, headers=headers, params=params)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_exc=e
-            await asyncio.sleep(sleep*(i+1))
-    raise last_exc
-
+# --------- Telegram
 async def send_tg(text: str, chat_id: Optional[str] = None):
     if not SEND_ENABLED: return
     cid = chat_id or TG_CHAT
     if not cid: return
     async with httpx.AsyncClient(timeout=12) as s:
-        try:
-            await s.post(TG_SEND, json={"chat_id": cid, "text": text})
-        except Exception:
-            traceback.print_exc()
+        await s.post(TG_SEND, json={"chat_id": cid, "text": text})
 
 def action_line(eth_price: float) -> str:
     if eth_price < ETH_HEDGE_2:
@@ -196,35 +206,32 @@ def action_line(eth_price: float) -> str:
         return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
     return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
 
-# ====== MARKET SNAPSHOTS (1m) ======
-async def coinbase_price(product: str) -> Tuple[float, Optional[float], Optional[float]]:
-    """Retorna last, high, low do produto (ETH-USD/BTC-USD). Coinbase ticker não dá H/L do dia,
-       então devolvemos NaN para manter compatibilidade."""
+# --------- Market snapshots (1m)
+async def get_spot_prices() -> dict:
+    # Prioriza Coinbase (confiável e sem 403 regionais). Tenta Bybit/Binance como extra.
     try:
-        j = await fetch_json_retry(COINBASE_TICKER.format(prod=product))
-        last = float(j.get("price") or j.get("last") or j["trade_id"]*0)  # fallback de segurança
-        # melhor: 'price' (string). se não vier, falha.
-        return float(j["price"]), math.nan, math.nan
+        e = await fetch_json_retry(COINBASE_TICKER.format(prod="ETH-USD"))
+        b = await fetch_json_retry(COINBASE_TICKER.format(prod="BTC-USD"))
+        eth_p = float(e["price"]); btc_p = float(b["price"])
+        # Try highs/lows via Binance 24h (pode dar 451; ignora se falhar)
+        try:
+            e24 = await fetch_json_retry(BINANCE_24H.format(sym="ETHUSDT"))
+            b24 = await fetch_json_retry(BINANCE_24H.format(sym="BTCUSDT"))
+            eth_h = float(e24.get("highPrice", "nan")); eth_l = float(e24.get("lowPrice", "nan"))
+            btc_h = float(b24.get("highPrice", "nan")); btc_l = float(b24.get("lowPrice", "nan"))
+        except Exception:
+            eth_h = eth_l = btc_h = btc_l = math.nan
+        return {
+            "eth": {"price": eth_p, "high": eth_h, "low": eth_l},
+            "btc": {"price": btc_p, "high": btc_h, "low": btc_l},
+        }
     except Exception:
-        return math.nan, math.nan, math.nan
-
-async def get_spot_snapshot() -> dict:
-    # tenta Bybit spot para ETH/BTC; fallback Coinbase
-    out = {"eth":{"price":math.nan,"high":math.nan,"low":math.nan},
-           "btc":{"price":math.nan,"high":math.nan,"low":math.nan}}
-    try:
-        eth = (await fetch_json_retry(BYBIT_SPOT.format(sym="ETHUSDT")))["result"]["list"][0]
-        out["eth"] = {"price": float(eth["lastPrice"]), "high": float(eth["highPrice"]), "low": float(eth["lowPrice"])}
-    except Exception:
-        p,h,l = await coinbase_price("ETH-USD")
-        out["eth"] = {"price": p, "high": h, "low": l}
-    try:
-        btc = (await fetch_json_retry(BYBIT_SPOT.format(sym="BTCUSDT")))["result"]["list"][0]
-        out["btc"] = {"price": float(btc["lastPrice"]), "high": float(btc["highPrice"]), "low": float(btc["lowPrice"])}
-    except Exception:
-        p,h,l = await coinbase_price("BTC-USD")
-        out["btc"] = {"price": p, "high": h, "low": l}
-    return out
+        # Fallback final: Coingecko (pode 429)
+        cg = await fetch_json_retry("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd", tries=2)
+        return {
+            "eth": {"price": float(cg["ethereum"]["usd"]), "high": math.nan, "low": math.nan},
+            "btc": {"price": float(cg["bitcoin"]["usd"]),  "high": math.nan, "low": math.nan},
+        }
 
 async def get_derivatives_snapshot() -> dict:
     funding = None; open_interest = None
@@ -243,13 +250,11 @@ async def get_derivatives_snapshot() -> dict:
 async def ingest_1m():
     try:
         now = dt.datetime.now(dt.UTC).replace(second=0, microsecond=0)
-        spot = await get_spot_snapshot()
+        spot = await get_spot_prices()
         der  = await get_derivatives_snapshot()
         eth_p = spot["eth"]["price"]; btc_p = spot["btc"]["price"]
         eth_h = spot["eth"]["high"];  eth_l = spot["eth"]["low"]
         btc_h = spot["btc"]["high"];  btc_l = spot["btc"]["low"]
-        if any(math.isnan(x) for x in (eth_p, btc_p)):
-            return
         ethbtc = eth_p / btc_p
         async with pool.acquire() as c:
             await c.execute(
@@ -275,17 +280,24 @@ async def ingest_1m():
     finally:
         last_run["ingest_1m"] = now_local_iso()
 
-# ====== WHALES (30s) ======
+# --------- Whales (30s) com anti-spam
 _last_trade_time_ms = 0
 _ws_lock = asyncio.Lock()
+_last_whale_tg_ts: float = 0.0
+_last_whale_sig: str = ""
 
 async def whales_bybit() -> List[Tuple[str,float,float,str]]:
-    """Tenta agregar fluxos grandes a partir do endpoint recent-trade da Bybit."""
     global _last_trade_time_ms
-    data = (await fetch_json_retry(BYBIT_RECENT_TRADES))["result"]["list"]
+    try:
+        data = (await fetch_json_retry(BYBIT_RECENT_TRADES))["result"]["list"]
+    except Exception:
+        # tenta domínio alternativo
+        alt = BYBIT_PUBLIC_ALT + "/v5/market/recent-trade?category=linear&symbol=ETHUSDT&limit=1000"
+        data = (await fetch_json_retry(alt))["result"]["list"]
     new = [t for t in data if int(t.get("time", 0)) > _last_trade_time_ms]
     if not new: return []
     _last_trade_time_ms = max(int(t.get("time", 0)) for t in new)
+
     buy_usd=sell_usd=0.0; buy_qty=sell_qty=0.0
     for t in new:
         price=float(t["price"]); qty=float(t["qty"])
@@ -294,15 +306,13 @@ async def whales_bybit() -> List[Tuple[str,float,float,str]]:
         if side=="BUY":  buy_usd+=usd; buy_qty+=qty
         else:            sell_usd+=usd; sell_qty+=qty
     events=[]
-    if buy_usd>=WHALE_USD_MIN: events.append(("BUY", buy_qty,  buy_usd,  f"agg {len(new)} trades"))
-    if sell_usd>=WHALE_USD_MIN: events.append(("SELL", sell_qty, sell_usd, f"agg {len(new)} trades"))
+    if buy_usd>=WHALE_USD_MIN: events.append(("BUY", buy_qty,  buy_usd,  f"bybit agg {len(new)}"))
+    if sell_usd>=WHALE_USD_MIN: events.append(("SELL", sell_qty, sell_usd, f"bybit agg {len(new)}"))
     return events
 
-async def whales_coinbase() -> List[Tuple[str,float,float,str]]:
-    """Fallback via Coinbase recent trades (ETH-USD)."""
+async def whales_coinbase() -> Tuple[List[Tuple[str,float,float,str]], Optional[Tuple[float,float,float,float,int]]]:
     try:
         lst = await fetch_json_retry(COINBASE_TRADES.format(prod="ETH-USD"))
-        # lst é lista de dicts com price, size, side (buy/sell), time
         buy_usd = sell_usd = 0.0
         buy_qty = sell_qty = 0.0
         for t in lst:
@@ -311,35 +321,66 @@ async def whales_coinbase() -> List[Tuple[str,float,float,str]]:
             if side == "BUY":  buy_usd += usd; buy_qty += qty
             else:              sell_usd += usd; sell_qty += qty
         events=[]
-        if buy_usd>=WHALE_USD_MIN: events.append(("BUY", buy_qty,  buy_usd,  f"coinbase agg {len(lst)}"))
-        if sell_usd>=WHALE_USD_MIN: events.append(("SELL", sell_qty, sell_usd, f"coinbase agg {len(lst)}"))
-        return events
+        if buy_usd>=COINBASE_MIN_ALERT_USD: events.append(("BUY", buy_qty,  buy_usd,  f"coinbase agg {len(lst)}"))
+        if sell_usd>=COINBASE_MIN_ALERT_USD: events.append(("SELL", sell_qty, sell_usd, f"coinbase agg {len(lst)}"))
+        return events, (buy_usd, sell_usd, buy_qty, sell_qty, len(lst))
     except Exception:
-        return []
+        return [], None
 
 async def ingest_whales():
+    global _last_whale_tg_ts, _last_whale_sig
     try:
-        events=[]
-        try:
+        events: List[Tuple[str,float,float,str]] = []
+        raw_cb = None
+
+        src = WHALE_SOURCE
+        if src == "bybit":
             events = await whales_bybit()
-        except Exception:
-            # 403 etc → fallback coinbase
-            events = await whales_coinbase()
-        if events:
-            ts = dt.datetime.now(dt.UTC)
-            async with pool.acquire() as c:
-                for side, qty, usd, note in events:
+        elif src == "coinbase":
+            events, raw_cb = await whales_coinbase()
+        else:  # auto
+            try:
+                events = await whales_bybit()
+            except Exception:
+                events, raw_cb = await whales_coinbase()
+
+        ts = dt.datetime.now(dt.UTC)
+        async with pool.acquire() as c:
+            if raw_cb:
+                buy_usd, sell_usd, buy_qty, sell_qty, n = raw_cb
+                if buy_usd >= WHALE_USD_MIN:
                     await c.execute(
                         "INSERT INTO whale_events(ts,venue,side,qty,usd_value,note) VALUES($1,$2,$3,$4,$5,$6)",
-                        ts, "perp", side, qty, usd, note
+                        ts, "coinbase", "BUY", buy_qty, buy_usd, f"agg {n}"
+                    )
+                if sell_usd >= WHALE_USD_MIN:
+                    await c.execute(
+                        "INSERT INTO whale_events(ts,venue,side,qty,usd_value,note) VALUES($1,$2,$3,$4,$5,$6)",
+                        ts, "coinbase", "SELL", sell_qty, sell_usd, f"agg {n}"
                     )
             for side, qty, usd, note in events:
-                await send_tg(f"🐋 {side} ~ ${usd:,.0f} | qty ~ {qty:,.1f} | {note}")
+                venue = "bybit" if "bybit" in (note or "") else "coinbase"
+                await c.execute(
+                    "INSERT INTO whale_events(ts,venue,side,qty,usd_value,note) VALUES($1,$2,$3,$4,$5,$6)",
+                    ts, venue, side, qty, usd, note
+                )
+
+        # Anti-spam: cooldown + dedupe
+        if WHALE_ALERTS_ENABLED and events:
+            now = time.time()
+            if now - _last_whale_tg_ts >= WHALE_COOLDOWN_SEC:
+                top = max(events, key=lambda x: x[2])
+                sig = f"{top[0]}:{int(top[2]//100000)}:{top[3].split()[0]}"
+                if sig != _last_whale_sig:
+                    for side, qty, usd, note in events:
+                        await send_tg(f"🐋 {side} ~ ${usd:,.0f} | qty ~ {qty:,.1f} | {note}")
+                    _last_whale_sig = sig
+                    _last_whale_tg_ts = now
     finally:
         last_run["ingest_whales"] = now_local_iso()
 
-# ====== ACCOUNTS (5m) ======
-BYBIT_API = BYBIT_PUBLIC
+# --------- Accounts (5m)
+BYBIT_API = "https://api.bybit.com"
 
 def bybit_sign_qs(secret: str, params: Dict[str, Any]) -> str:
     qs = "&".join([f"{k}={params[k]}" for k in sorted(params)])
@@ -352,21 +393,10 @@ async def bybit_private_get(path: str, extra: Dict[str, Any]) -> Dict[str, Any]:
     sign = bybit_sign_qs(BYBIT_SEC, payload)
     payload["sign"] = sign
     url = f"{BYBIT_API}{path}"
-    async with httpx.AsyncClient(timeout=20) as s:
+    async with httpx.AsyncClient(timeout=20, headers=_DEFAULT_HEADERS) as s:
         r = await s.get(url, params=payload)
         r.raise_for_status()
         return r.json()
-
-AAVE_SUBGRAPH = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
-AAVE_QUERY = """
-query ($user: String!) {
-  userReserves(where: { user: $user }) {
-    reserve { symbol, decimals }
-    scaledATokenBalance
-    scaledVariableDebt
-  }
-}
-"""
 
 async def snapshot_bybit() -> List[Dict[str, Any]]:
     if not (BYBIT_KEY and BYBIT_SEC): return []
@@ -387,12 +417,22 @@ async def snapshot_bybit() -> List[Dict[str, Any]]:
         traceback.print_exc()
     return out
 
+AAVE_SUBGRAPH_URL = "https://api.thegraph.com/subgraphs/name/aave/protocol-v3"
+AAVE_QUERY = """
+query ($user: String!) {
+  userReserves(where: { user: $user }) {
+    reserve { symbol, decimals }
+    scaledATokenBalance
+    scaledVariableDebt
+  }
+}
+"""
 async def snapshot_aave() -> List[Dict[str, Any]]:
     if not AAVE_ADDR: return []
     out=[]
     try:
-        async with httpx.AsyncClient(timeout=25) as s:
-            r=await s.post(AAVE_SUBGRAPH,json={"query":AAVE_QUERY,"variables":{"user":AAVE_ADDR.lower()}})
+        async with httpx.AsyncClient(timeout=25, headers=_DEFAULT_HEADERS) as s:
+            r=await s.post(AAVE_SUBGRAPH_URL,json={"query":AAVE_QUERY,"variables":{"user":AAVE_ADDR.lower()}})
             r.raise_for_status()
             data=r.json()
         reserves=data.get("data",{}).get("userReserves",[])
@@ -413,15 +453,17 @@ async def ingest_accounts():
     rows=[]
     rows += await snapshot_bybit()
     rows += await snapshot_aave()
-    if rows:
-        async with pool.acquire() as c:
-            for r in rows:
-                await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
+    if not rows:
+        last_run["ingest_accounts"] = now_local_iso()
+        return
+    async with pool.acquire() as c:
+        for r in rows:
+            await c.execute("INSERT INTO account_snap(venue,metric,value) VALUES($1,$2,$3)", r["venue"], r["metric"], r["value"])
     last_run["ingest_accounts"] = now_local_iso()
 
-# ====== ONCHAIN (5m opcional) ======
+# --------- On-chain (opcional)
 async def ingest_onchain_eth(addr: str):
-    if not ETHERSCAN_API_KEY: 
+    if not ETHERSCAN_API_KEY:
         last_run["ingest_onchain"] = now_local_iso()
         return
     try:
@@ -445,140 +487,200 @@ async def ingest_onchain_eth(addr: str):
     finally:
         last_run["ingest_onchain"] = now_local_iso()
 
-# ====== NEWS (10m) ======
-def parse_rss(xml_text: str) -> List[Tuple[str,str]]:
-    out=[]
+# --------- Notícias (RSS) + análise
+_THEMES = [
+    (r"\betf\b|\bspot etf\b", "ETF"),
+    (r"liquidation|short squeeze|longs|funding", "Derivativos"),
+    (r"hack|exploit|vulnerability|rug", "Segurança"),
+    (r"sec\b|regulat|policy|ban|approval", "Regulatório"),
+    (r"halving|issuance|supply|burn", "Oferta"),
+    (r"layer-2|L2|rollup|optimism|arbitrum|base\b", "L2"),
+    (r"whale|flow|inflow|outflow", "Fluxo"),
+    (r"defi|aave|compound|uniswap|lending|staking", "DeFi"),
+    (r"bitcoin|btc", "BTC"),
+    (r"ethereum|eth", "ETH"),
+]
+
+def extract_rss_items(xml: str, source: str) -> List[Dict[str,Any]]:
+    # parse simples via regex (suficiente para títulos/links/datas)
+    items=[]
+    for m in re.finditer(r"<item>(.*?)</item>", xml, flags=re.S|re.I):
+        block = m.group(1)
+        title = re.search(r"<title>(<!\[CDATA\[)?(.*?)(\]\]>)?</title>", block, flags=re.S|re.I)
+        link  = re.search(r"<link>(.*?)</link>", block, flags=re.S|re.I)
+        pub   = re.search(r"<pubDate>(.*?)</pubDate>", block, flags=re.S|re.I)
+        t = (title.group(2) if title and title.group(2) else (title.group(1) if title else "")).strip()
+        u = (link.group(1) if link else "").strip()
+        p = (pub.group(1) if pub else "").strip()
+        items.append({"title": t, "url": u, "pub": p, "source": source})
+    return items
+
+def classify_themes(title: str) -> List[str]:
+    t = title.lower()
+    themes = []
+    for pat, lab in _THEMES:
+        if re.search(pat, t):
+            themes.append(lab)
+    return list(dict.fromkeys(themes))[:4]  # únicas, até 4
+
+def parse_rfc2822(s: str) -> Optional[dt.datetime]:
     try:
-        root = ET.fromstring(xml_text)
-        for item in root.findall(".//item"):
-            title = (item.findtext("title") or "").strip()
-            link  = (item.findtext("link") or "").strip()
-            if title:
-                out.append((title, link))
+        from email.utils import parsedate_to_datetime
+        d = parsedate_to_datetime(s)
+        if d.tzinfo is None: d = d.replace(tzinfo=dt.timezone.utc)
+        return d.astimezone(dt.timezone.utc)
     except Exception:
-        pass
-    return out[:15]
+        return None
 
 async def ingest_news():
-    now = dt.datetime.now(dt.UTC)
-    rows=[]
+    window = dt.datetime.now(dt.UTC) - dt.timedelta(hours=NEWS_WINDOW_H)
+    all_items=[]
     for src in NEWS_SOURCES:
+        url = RSS.get(src)
+        if not url: continue
         try:
-            xml = await fetch_text(src.strip())
-            items = parse_rss(xml)
-            for title, url in items:
-                rows.append((now, src, title, url))
+            xml = await fetch_text(url)
+            items = extract_rss_items(xml, src)
+            for it in items:
+                ts_pub = parse_rfc2822(it["pub"])
+                if ts_pub and ts_pub < window: continue
+                it["ts_pub"] = ts_pub
+                it["themes"] = ", ".join(classify_themes(it["title"]))
+                all_items.append(it)
         except Exception:
             continue
-    if rows:
-        async with pool.acquire() as c:
-            # guarda últimas ~60 (cap)
-            for ts, src, title, url in rows[:60]:
-                await c.execute("INSERT INTO news(ts,source,title,url) VALUES($1,$2,$3,$4)", ts, src, title, url)
-            await c.execute("DELETE FROM news WHERE id NOT IN (SELECT id FROM news ORDER BY id DESC LIMIT 400)")
+    # Ordena por ts_pub desc, limita
+    all_items.sort(key=lambda x: x.get("ts_pub") or dt.datetime.now(dt.UTC), reverse=True)
+    all_items = all_items[:NEWS_MAX_ITEMS]
+    if not all_items:
+        last_run["news"] = now_local_iso(); return
+    async with pool.acquire() as c:
+        for it in all_items:
+            await c.execute(
+                "INSERT INTO news_items(ts_pub, source, title, url, themes) VALUES($1,$2,$3,$4,$5)",
+                it.get("ts_pub"), it["source"], it["title"], it["url"], it["themes"]
+            )
     last_run["news"] = now_local_iso()
 
-def summarize_news(titles: List[str]) -> str:
-    """sintetiza temas em 2–3 bullets simples (heurística leve)."""
-    t = " ".join(titles).lower()
-    bullets=[]
-    if any(k in t for k in ["etf", "spot etf", "sec", "approval"]): bullets.append("ETF/fluxos institucionais em foco.")
-    if any(k in t for k in ["upgrade", "hard fork", "dencun", "proto-dank", "eip"]): bullets.append("Narrativa técnica/upgrade em destaque no ETH.")
-    if any(k in t for k in ["liquidation", "liquidations", "rekt"]): bullets.append("Liquidações relevantes afetaram volatilidade.")
-    if any(k in t for k in ["funding", "open interest", "oi"]): bullets.append("Derivativos (funding/OI) ditando curto prazo.")
-    if not bullets: bullets.append("Fluxo de notícias sem um driver único dominante.")
-    return " • " + "\n • ".join(bullets)
+async def news_summary(hours: int = 8) -> Tuple[str, List[str]]:
+    start = dt.datetime.now(dt.UTC) - dt.timedelta(hours=hours)
+    async with pool.acquire() as c:
+        rows = await c.fetch("""
+            SELECT ts_pub, source, title, url, themes
+            FROM news_items
+            WHERE (ts_pub IS NULL OR ts_pub >= $1)
+            ORDER BY ts_pub DESC NULLS LAST
+            LIMIT 40
+        """, start)
+    if not rows:
+        return "Fluxo de notícias sem um driver único dominante.", []
+    # score por tema
+    score={}
+    links=[]
+    for r in rows:
+        th = (r["themes"] or "").split(",")
+        for t in th:
+            t=t.strip()
+            if not t: continue
+            score[t]=score.get(t,0)+1
+        if len(links)<6:
+            links.append(f"• [{r['source']}] {r['title']}")
+    # escolhe 2–3 temas principais
+    ranked = sorted(score.items(), key=lambda x:x[1], reverse=True)
+    tops = [t for t,_ in ranked[:3]]
+    if not tops:
+        text = "Fluxo de notícias misto; sem tema dominante."
+    else:
+        text = "Temas de notícia: " + ", ".join(tops) + "."
+    return text, links[:6]
 
-# ====== COMENTÁRIO 6–8h ======
-async def build_commentary(include_themes: bool=True) -> str:
+# --------- Comentário 6–8h
+def pct(a,b): 
+    try:
+        return 0.0 if a==0 else (b-a)/a*100.0
+    except Exception:
+        return 0.0
+
+async def build_commentary() -> str:
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=8)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT ts, eth_usd, btc_usd, eth_btc_ratio FROM market_rel WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
         deriv = await c.fetch("SELECT ts, funding, open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        news_rows = await c.fetch("SELECT ts,title FROM news WHERE ts BETWEEN $1 AND $2 ORDER BY id DESC LIMIT 20", start, end)
-    if not rows: return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
+        whales = await c.fetch("SELECT ts, side, usd_value, venue FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+    if not rows:
+        return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
 
     eth = [float(r["eth_usd"]) for r in rows]; btc = [float(r["btc_usd"]) for r in rows]; ratio = [float(r["eth_btc_ratio"]) for r in rows]
-    def pct(a,b): return 0.0 if a==0 else (b-a)/a*100.0
     eth_chg = pct(eth[0], eth[-1]); btc_chg = pct(btc[0], btc[-1]); ratio_chg = pct(ratio[0], ratio[-1])
     funding = float(deriv[-1]["funding"]) if deriv and deriv[-1]["funding"] is not None else None
     oi = float(deriv[-1]["open_interest"]) if deriv and deriv[-1]["open_interest"] is not None else None
-
-    buy = sum(float(w["usd_value"] or 0) for w in whales if (w["side"] or "").upper()=="BUY")
-    sell= sum(float(w["usd_value"] or 0) for w in whales if (w["side"] or "").upper()=="SELL")
-    flow = "neutra"; 
+    buy = sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="BUY")
+    sell= sum(float(w["usd_value"] or 0) for w in whales if w["side"]=="SELL")
+    flow = "neutra"
     if buy>sell*1.3: flow="compradora"
     elif sell>buy*1.3: flow="vendedora"
 
-    titles=[r["title"] for r in news_rows]
-    themes = summarize_news(titles) if include_themes else ""
+    news_text, news_bullets = await news_summary(8)
 
     lines=[]
     lines.append("🧾 Comentário (últimas 8h)")
     lines.append(f"• ETH: {eth_chg:+.2f}% | BTC: {btc_chg:+.2f}% | ETH/BTC: {ratio_chg:+.2f}%")
     if funding is not None or oi is not None:
-        comp = []
-        if funding is not None: comp.append(f"funding {funding*100:.3f}%/8h")
-        if oi is not None: comp.append(f"OI ~ {oi:,.0f}")
-        lines.append("• Derivativos: " + ", ".join(comp))
+        fr = (f" | funding {funding*100:.3f}%/8h" if funding is not None else "")
+        orr = (f" | OI ~ {oi:,.0f}" if oi is not None else "")
+        lines.append(f"• Derivativos:{fr}{orr}")
     lines.append(f"• Fluxo de baleias: {flow} (BUY ${buy:,.0f} vs SELL ${sell:,.0f})")
-    if include_themes:
-        lines.append("• Temas de notícia:" + ("\n" + themes if themes else " fluxo discreto."))
+    lines.append("• " + news_text)
+    if news_bullets:
+        lines.append("• Pautas:")
+        for b in news_bullets[:4]:
+            lines.append("  " + b)
     # Síntese
     if ratio_chg>0 and (funding is None or funding<0.0005):
-        synth="pró-ETH (força relativa + funding contido)."
+        synth = "pró-ETH (força relativa + funding contido)."
     elif ratio_chg<0 and (funding is not None and funding>0.001):
-        synth="pró-cautela (BTC dominante + funding elevado)."
+        synth = "BTC dominante / atenção à euforia (funding alto)."
     else:
-        synth="equilíbrio tático; operar pelos gatilhos de preço."
-    lines.append("🧭 Síntese: " + synth)
+        synth = "equilíbrio tático; usar gatilhos de preço."
+    lines.append(f"🧭 Síntese: {synth}")
     return "\n".join(lines)
 
-async def latest_prices_block() -> Tuple[str,float]:
+async def latest_pulse_text() -> str:
     async with pool.acquire() as c:
         m = await c.fetchrow("SELECT * FROM market_rel ORDER BY ts DESC LIMIT 1")
         e = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol='ETHUSDT' ORDER BY ts DESC LIMIT 1")
         b = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol='BTCUSDT' ORDER BY ts DESC LIMIT 1")
         d = await c.fetchrow("SELECT * FROM derivatives_snap WHERE symbol='ETHUSDT' AND exchange='bybit' ORDER BY ts DESC LIMIT 1")
-    if not (m and e and b): 
-        return "⏳ Aguardando primeiros dados…", math.nan
+    if not (m and e and b):
+        return "⏳ Aguardando primeiros dados…"
+    now = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     eth = float(m["eth_usd"]); btc = float(m["btc_usd"]); ratio = float(m["eth_btc_ratio"])
     eh, el, bh, bl = e["high"], e["low"], b["high"], b["low"]
-    parts=[f"🕒 {dt.datetime.now(TZ).strftime('%Y-%m-%d %H:%M')}",
-           f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if isinstance(eh,(int,float)) and isinstance(el,(int,float)) else ""),
-           f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if isinstance(bh,(int,float)) and isinstance(bl,(int,float)) else ""),
-           f"ETH/BTC: {ratio:.5f}"]
-    if d and d["funding"] is not None: parts.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
-    if d and d["open_interest"] is not None: parts.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
-    return "\n".join(parts), eth
-
-async def latest_pulse_text(include_themes=True) -> str:
-    header, eth = await latest_prices_block()
-    if math.isnan(eth):
-        return header
-    parts=[header]
-    # ação
-    parts.append(action_line(eth))
-    parts.append("")  # espaço
-    parts.append(await build_commentary(include_themes=include_themes))
+    parts=[
+        f"🕒 {now}",
+        f"ETH: ${eth:,.2f}" + (f" | H:{eh:,.2f} / L:{el:,.2f}" if isinstance(eh,(int,float)) and isinstance(el,(int,float)) else ""),
+        f"BTC: ${btc:,.2f}" + (f" | H:{bh:,.2f} / L:{bl:,.2f}" if isinstance(bh,(int,float)) and isinstance(bl,(int,float)) else ""),
+        f"ETH/BTC: {ratio:.5f}",
+        f"↪ {action_line(eth)}",
+        "",
+        await build_commentary()
+    ]
     return "\n".join(parts)
 
 async def send_pulse_to_chat():
     await send_tg(await latest_pulse_text())
 
-# ====== FASTAPI ======
+# --------- FastAPI
 @app.on_event("startup")
 async def _startup():
     await db_init()
-    # Ingests
+    # jobs
     scheduler.add_job(ingest_1m, "interval", minutes=1, id="ingest_1m", replace_existing=True)
     scheduler.add_job(ingest_whales, "interval", seconds=30, id="ingest_whales", replace_existing=True)
     scheduler.add_job(ingest_accounts, "interval", minutes=5, id="ingest_accounts", replace_existing=True)
+    scheduler.add_job(ingest_news, "interval", minutes=15, id="ingest_news", replace_existing=True)
     if AAVE_ADDR and ETHERSCAN_API_KEY:
         scheduler.add_job(ingest_onchain_eth, "interval", minutes=5, args=[AAVE_ADDR], id="ingest_onchain", replace_existing=True)
-    scheduler.add_job(ingest_news, "interval", minutes=10, id="ingest_news", replace_existing=True)
-    # Boletins
     scheduler.add_job(send_pulse_to_chat, "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
@@ -597,12 +699,11 @@ async def status():
         ds = await c.fetchval("SELECT COUNT(1) FROM derivatives_snap")
         whales = await c.fetchval("SELECT COUNT(1) FROM whale_events")
         acc = await c.fetchval("SELECT COUNT(1) FROM account_snap")
-        news = await c.fetchval("SELECT COUNT(1) FROM news")
+        news = await c.fetchval("SELECT COUNT(1) FROM news_items")
     return {
         "counts":{
             "market_rel": mr, "candles_eth": cm_eth, "candles_btc": cm_btc,
-            "derivatives": ds, "whale_events": whales, "account_snap": acc,
-            "news": news
+            "derivatives": ds, "whale_events": whales, "account_snap": acc, "news": news
         },
         "last_run": last_run
     }
@@ -612,53 +713,19 @@ async def run_accounts():
     await ingest_accounts()
     return {"ok": True, "ran_at": last_run["ingest_accounts"]}
 
-# ----- Simple price endpoints for /eth and /btc commands
-async def simple_line(sym: str) -> str:
-    async with pool.acquire() as c:
-        row = await c.fetchrow("SELECT * FROM candles_minute WHERE symbol=$1 ORDER BY ts DESC LIMIT 1", sym)
-        rel = await c.fetchrow("SELECT * FROM market_rel ORDER BY ts DESC LIMIT 1")
-    if not (row and rel): return "⏳ Aguardando dados…"
-    price = float(rel["eth_usd"] if sym=="ETHUSDT" else rel["btc_usd"])
-    h, l = row["high"], row["low"]
-    ratio = float(rel["eth_btc_ratio"])
-    head = f"{'ETH' if sym=='ETHUSDT' else 'BTC'}: ${price:,.2f}" + (f" | H:{h:,.2f}/L:{l:,.2f}" if isinstance(h,(int,float)) and isinstance(l,(int,float)) else "")
-    tail = f" | ETH/BTC: {ratio:.5f}" if sym=="ETHUSDT" else f" | ETH/BTC: {ratio:.5f}"
-    return head + tail + "\n" + action_line(float(rel["eth_usd"]))
+@app.post("/run/news")
+async def run_news():
+    await ingest_news()
+    return {"ok": True, "ran_at": last_run["news"]}
 
 @app.get("/pulse")
 async def pulse():
-    text = await latest_pulse_text(include_themes=True)
+    text = await latest_pulse_text()
     await send_tg(text)
     return {"ok": True, "message": text}
-
-@app.get("/alfa")
-@app.get("/alpha")
-async def alpha():
-    text = await latest_pulse_text(include_themes=True)
-    text += "\n\n🧠 Drivers prováveis: cruzamos variação 8h, funding/OI, fluxo de baleias e temas de notícia para explicar movimentos de curto prazo."
-    await send_tg(text)
-    return {"ok": True, "message": text}
-
-@app.get("/eth")
-async def eth_view():
-    text = await simple_line("ETHUSDT")
-    await send_tg(text)
-    return {"ok": True, "message": text}
-
-@app.get("/btc")
-async def btc_view():
-    text = await simple_line("BTCUSDT")
-    await send_tg(text)
-    return {"ok": True, "message": text}
-
-# ----- Telegram webhook
-def _handle_cmd(low: str, text: str, chat_id: str):
-    return low, text, chat_id
 
 @app.post("/webhook")
-@app.post("/webhook/{token}")
-async def telegram_webhook(request: Request, token: Optional[str]=None):
-    # se token for informado, apenas valida forma; não bloqueia
+async def telegram_webhook(request: Request):
     try: update = await request.json()
     except Exception: return {"ok": True}
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
@@ -668,32 +735,49 @@ async def telegram_webhook(request: Request, token: Optional[str]=None):
     low = text.lower()
 
     if low in ("/start","start"):
-        await send_tg("✅ Bot online.\nComandos: /pulse, /alfa, /eth, /btc, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id); return {"ok": True}
+        await send_tg("✅ Bot online. Comandos: /pulse, /chart eth|btc, /eth, /btc, /alfa, /diag, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id); 
+        return {"ok": True}
+
     if low == "/pulse":
         await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
+
+    if low in ("/eth","eth"):
+        async with pool.acquire() as c:
+            m = await c.fetchrow("SELECT eth_usd, eth_btc_ratio FROM market_rel ORDER BY ts DESC LIMIT 1")
+        if m:
+            await send_tg(f"ETH: ${float(m['eth_usd']):,.2f} | ETH/BTC: {float(m['eth_btc_ratio']):.5f}\n↪ {action_line(float(m['eth_usd']))}", chat_id)
+        return {"ok": True}
+
+    if low in ("/btc","btc"):
+        async with pool.acquire() as c:
+            m = await c.fetchrow("SELECT btc_usd, eth_btc_ratio FROM market_rel ORDER BY ts DESC LIMIT 1")
+        if m:
+            await send_tg(f"BTC: ${float(m['btc_usd']):,.2f} | ETH/BTC: {float(m['eth_btc_ratio']):.5f}\n↪ {action_line(float(m['btc_usd']) * float(m['eth_btc_ratio']))}", chat_id)
+        return {"ok": True}
+
     if low in ("/alfa","/alpha"):
-        await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
-    if low == "/eth":
-        await send_tg(await simple_line("ETHUSDT"), chat_id); return {"ok": True}
-    if low == "/btc":
-        await send_tg(await simple_line("BTCUSDT"), chat_id); return {"ok": True}
+        await send_tg(await build_commentary(), chat_id); return {"ok": True}
+
     if low == "/notes":
         async with pool.acquire() as c:
             rows = await c.fetch("SELECT created_at,text FROM notes ORDER BY id DESC LIMIT 5")
         if not rows: await send_tg("Sem notas ainda.", chat_id); return {"ok": True}
         out=["Notas recentes:"]+[f"- {r['created_at']:%m-%d %H:%M} • {r['text']}" for r in rows]
         await send_tg("\n".join(out), chat_id); return {"ok": True}
+
     if low == "/strat last":
         async with pool.acquire() as c:
             row = await c.fetchrow("SELECT created_at,name,version,note FROM strategy_versions ORDER BY id DESC LIMIT 1")
         if not row: await send_tg("Nenhuma estratégia salva.", chat_id); return {"ok": True}
         await send_tg(f"Última estratégia:\n{row['created_at']:%Y-%m-%d %H:%M}\n{row['name']} v{row['version']}\n{row['note'] or ''}", chat_id); return {"ok": True}
+
     if low.startswith("/note"):
         note = text[len("/note"):].strip()
         if not note: await send_tg("Uso: /note seu texto aqui", chat_id); return {"ok": True}
         async with pool.acquire() as c:
             await c.execute("INSERT INTO notes(tag,text) VALUES($1,$2)", None, note)
         await send_tg("📝 Nota salva.", chat_id); return {"ok": True}
+
     if low.startswith("/strat new"):
         try:
             payload = text[len("/strat new"):].strip()
@@ -703,10 +787,10 @@ async def telegram_webhook(request: Request, token: Optional[str]=None):
         async with pool.acquire() as c:
             await c.execute("INSERT INTO strategy_versions(name,version,note) VALUES($1,$2,$3)", name, version, note)
         await send_tg(f"📌 Estratégia salva: {name} v{version}", chat_id); return {"ok": True}
-    await send_tg("Comando não reconhecido. Use /pulse, /alfa, /eth, /btc, /note, /strat new, /strat last, /notes.", chat_id)
+
+    await send_tg("Comando não reconhecido. Use /pulse, /eth, /btc, /alfa, /note, /strat new, /strat last, /notes.", chat_id)
     return {"ok": True}
 
-# ----- Exporters
 @app.get("/export/notes.csv")
 async def export_notes():
     async with pool.acquire() as c:
@@ -725,6 +809,12 @@ async def export_strats():
     for r in rows: w.writerow([r["created_at"].isoformat(), r["name"], r["version"], r["note"] or ""])
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
-@app.get("/")
-async def root():
-    return {"service": "stark-defi-agent", "version": app.version}
+@app.get("/accounts/last")
+async def accounts_last():
+    async with pool.acquire() as c:
+        rows = await c.fetch("""
+            SELECT * FROM account_snap
+            WHERE ts > now() - interval '1 hour'
+            ORDER BY ts DESC, venue, metric
+        """)
+    return JSONResponse({"rows": [dict(r) for r in rows]})
