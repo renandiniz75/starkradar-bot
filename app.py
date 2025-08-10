@@ -1,164 +1,135 @@
-# app.py
-import os
-import logging
-import asyncio
-from datetime import time
+import os, math, datetime as dt
 from zoneinfo import ZoneInfo
 
 import httpx
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
-)
+from fastapi import FastAPI, Request
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# =========================
-# LOGGING
-# =========================
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("starkradar")
+# =======================
+# Config
+# =======================
+TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+SEND_ENABLED = bool(TELEGRAM_TOKEN and TELEGRAM_CHAT_ID)
 
-# =========================
-# ENV & CONSTANTES
-# =========================
-TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+ETH_HEDGE_1 = float(os.getenv("ETH_HEDGE_1", "3900"))
+ETH_HEDGE_2 = float(os.getenv("ETH_HEDGE_2", "3800"))
+ETH_CLOSE_HEDGE = float(os.getenv("ETH_CLOSE_HEDGE", "3950"))
 
-EXTERNAL_URL = (
-    os.environ.get("RENDER_EXTERNAL_URL")
-    or os.environ.get("EXTERNAL_URL")
-    or "https://starkradar-bot.onrender.com"
-).rstrip("/")
+BYBIT_SPOT = "https://api.bybit.com/v5/market/tickers?category=spot&symbol={sym}"
+BYBIT_FUNDING = "https://api.bybit.com/v5/market/funding/history?category=linear&symbol={sym}&limit=1"
+BYBIT_OI = "https://api.bybit.com/v5/market/open-interest?category=linear&symbol={sym}&interval=5min"
 
-PORT = int(os.environ.get("PORT", "10000"))
-WEBHOOK_PATH = "/webhook"  # simples e estável
-WEBHOOK_URL = f"{EXTERNAL_URL}{WEBHOOK_PATH}"
-TZ = ZoneInfo("America/Sao_Paulo")
+TG_SEND = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-# HTTP client
-HTTP_TIMEOUT = httpx.Timeout(10.0, read=10.0, connect=10.0)
-client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+app = FastAPI(title="starkradar-bot")
 
-# =========================
-# MARKET HELPERS (BINANCE)
-# =========================
-BINANCE_24H = "https://api.binance.com/api/v3/ticker/24hr"
-
-async def fetch_binance_24h(symbol: str) -> dict:
-    try:
-        r = await client.get(BINANCE_24H, params={"symbol": symbol})
+# =======================
+# Helpers
+# =======================
+async def fetch_json(url: str):
+    async with httpx.AsyncClient(timeout=10) as s:
+        r = await s.get(url)
         r.raise_for_status()
         return r.json()
-    except Exception as e:
-        log.warning("Erro Binance 24h %s: %s", symbol, e)
-        return {}
 
-def fmt_num(n: float, dec: int = 2) -> str:
+async def get_pair_snapshot():
+    # tenta Bybit; se falhar, usa CoinGecko
     try:
-        return f"{float(n):,.{dec}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        eth = (await fetch_json(BYBIT_SPOT.format(sym="ETHUSDT")))["result"]["list"][0]
+        btc = (await fetch_json(BYBIT_SPOT.format(sym="BTCUSDT")))["result"]["list"][0]
+        eth_p = float(eth["lastPrice"]); btc_p = float(btc["lastPrice"])
+        eth_h = float(eth["highPrice"]);  eth_l = float(eth["lowPrice"])
+        btc_h = float(btc["highPrice"]);  btc_l = float(btc["lowPrice"])
+        ethbtc = eth_p / btc_p
     except Exception:
-        return str(n)
+        cg = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd")
+        eth_p = float(cg["ethereum"]["usd"]); btc_p = float(cg["bitcoin"]["usd"])
+        eth_h = eth_l = btc_h = btc_l = math.nan
+        ethbtc = eth_p / btc_p
+    return eth_p, eth_h, eth_l, btc_p, btc_h, btc_l, ethbtc
 
-async def snapshot_msg(symbol: str, label: str) -> str:
-    data = await fetch_binance_24h(symbol)
-    if not data:
-        return f"⚠️ {label}: dados indisponíveis agora. Tente em instantes."
-    last = data.get("lastPrice")
-    pct  = data.get("priceChangePercent")
-    high = data.get("highPrice")
-    low  = data.get("lowPrice")
-    vol  = data.get("volume")
-    return (
-        f"📊 {label}\n"
-        f"• Último: **${fmt_num(last, 2)}**\n"
-        f"• 24h: {fmt_num(pct, 2)}%\n"
-        f"• Máx 24h: ${fmt_num(high, 2)} | Mín 24h: ${fmt_num(low, 2)}\n"
-        f"• Vol 24h: {fmt_num(vol, 2)} {label}\n"
-    )
-
-# =========================
-# HANDLERS
-# =========================
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("✅ Stark DeFi Brain online. Envie /eth ou /btc.")
-
-async def eth_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await snapshot_msg("ETHUSDT", "ETH")
-    await update.message.reply_markdown(msg)
-
-async def btc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = await snapshot_msg("BTCUSDT", "BTC")
-    await update.message.reply_markdown(msg)
-
-async def alfa_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("🚀 /alfa: varredura em desenvolvimento. Em breve, sinais.")
-
-# =========================
-# JOBS (BOLETINS)
-# =========================
-async def send_report(context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not CHAT_ID:
-        log.warning("CHAT_ID não configurado. Ignorando envio automático.")
-        return
-    eth = await snapshot_msg("ETHUSDT", "ETH")
-    btc = await snapshot_msg("BTCUSDT", "BTC")
-    header = "🧠 Stark DeFi Brain — Boletim automático"
-    text = f"{header}\n\n{eth}\n{btc}"
+async def get_derivatives_snapshot():
+    # funding (último), open interest (último ponto)
     try:
-        await context.bot.send_message(chat_id=int(CHAT_ID), text=text, parse_mode="Markdown")
-    except Exception as e:
-        log.warning("Falha ao enviar boletim: %s", e)
-
-def schedule_jobs(app: Application) -> None:
-    jq = app.job_queue
-    if jq is None:
-        log.warning("JobQueue não disponível. Instale: python-telegram-bot[job-queue]")
-        return
-    for hh, mm in [(8, 0), (12, 0), (17, 0), (19, 0)]:
-        jq.run_daily(
-            send_report,
-            time=time(hour=hh, minute=mm, tzinfo=TZ),
-            name=f"rep_{hh:02d}{mm:02d}",
-        )
-    log.info("Boletins agendados (BRT): 08:00, 12:00, 17:00, 19:00")
-
-# =========================
-# MAIN
-# =========================
-async def main_async():
-    if not TOKEN:
-        raise RuntimeError("TELEGRAM_BOT_TOKEN não definido")
-    application = Application.builder().token(TOKEN).build()
-
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("eth", eth_cmd))
-    application.add_handler(CommandHandler("btc", btc_cmd))
-    application.add_handler(CommandHandler("alfa", alfa_cmd))
-
-    schedule_jobs(application)
-
-    # define/atualiza webhook no Telegram e sobe servidor interno do PTB
-    await application.bot.set_webhook(WEBHOOK_URL)
-    await application.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=WEBHOOK_URL,
-    )
-
-def main():
+        f = (await fetch_json(BYBIT_FUNDING.format(sym="ETHUSDT")))["result"]["list"][0]
+        funding = float(f["fundingRate"])  # ex: 0.0001 -> 0.01%
+    except Exception:
+        funding = None
     try:
-        asyncio.run(main_async())
-    finally:
-        try:
-            import anyio
-            anyio.run(client.aclose)
-        except Exception:
-            pass
+        oi = (await fetch_json(BYBIT_OI.format(sym="ETHUSDT")))["result"]["list"][-1]
+        open_interest = float(oi["openInterest"])
+    except Exception:
+        open_interest = None
+    return funding, open_interest
 
-if __name__ == "__main__":
-    main()
+async def send_tg(text: str):
+    if not SEND_ENABLED:
+        return {"sent": False, "reason": "telegram not configured"}
+    async with httpx.AsyncClient(timeout=10) as s:
+        await s.post(TG_SEND, json={"chat_id": TELEGRAM_CHAT_ID, "text": text})
+
+def format_pulse(eth, eh, el, btc, bh, bl, ethbtc, funding, oi):
+    now = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
+    lines = [f"🕒 {now}",
+             f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if not math.isnan(eh) else ""),
+             f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if not math.isnan(bh) else ""),
+             f"ETH/BTC: {ethbtc:.5f}"]
+    if funding is not None:
+        lines.append(f"Funding (ETH perp): {funding*100:.3f}%/8h")
+    if oi is not None:
+        lines.append(f"Open Interest (ETH): {oi:,.0f}")
+    # regras
+    if eth < ETH_HEDGE_2:
+        lines.append(f"🚨 ETH < {ETH_HEDGE_2:.0f} → ampliar hedge p/ 20% (29 ETH).")
+    elif eth < ETH_HEDGE_1:
+        lines.append(f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH).")
+    elif eth > ETH_CLOSE_HEDGE:
+        lines.append(f"↩️ ETH > {ETH_CLOSE_HEDGE:.0f} → avaliar fechar hedge.")
+    else:
+        lines.append("✅ Sem gatilho de defesa. Suportes: 4.200/4.000 | Resist: 4.300/4.400.")
+    return "\n".join(lines)
+
+# =======================
+# Endpoints
+# =======================
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
+
+@app.get("/pulse")
+async def pulse():
+    eth, eh, el, btc, bh, bl, ethbtc = await get_pair_snapshot()
+    funding, oi = await get_derivatives_snapshot()
+    msg = format_pulse(eth, eh, el, btc, bh, bl, ethbtc, funding, oi)
+    await send_tg(msg)
+    return {"ok": True, "message": msg}
+
+@app.post("/hooks/tradingview")
+async def tv_hook(req: Request):
+    data = await req.json()
+    event = str(data.get("event","")).upper()
+    price = data.get("price", "—")
+    if event == "ETH_BREAKDOWN_3900":
+        text = f"⚠️ TradingView: ETH {price} < 3900 → sugerir hedge 15% (22 ETH)."
+    elif event == "ETH_BREAKDOWN_3800":
+        text = f"🚨 TradingView: ETH {price} < 3800 → ampliar hedge p/ 20% (29 ETH)."
+    elif event == "ETH_RECLAIM_3950":
+        text = f"↩️ TradingView: ETH {price} > 3950 → avaliar fechar hedge."
+    else:
+        text = f"ℹ️ TradingView: {event} @ {price}"
+    await send_tg(text)
+    return {"ok": True}
+
+# =======================
+# Heartbeat opcional (ex.: a cada 30min)
+# =======================
+scheduler = AsyncIOScheduler(timezone=str(TZ))
+def schedule_jobs():
+    if os.getenv("HEARTBEAT_MINUTES"):
+        minutes = int(os.getenv("HEARTBEAT_MINUTES", "30"))
+        scheduler.add_job(lambda: app.router.routes[1].endpoint(), 'interval', minutes=minutes, id="pulse_job", replace_existing=True)
+        scheduler.start()
+
+schedule_jobs()
