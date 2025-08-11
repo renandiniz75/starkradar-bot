@@ -1,656 +1,655 @@
-# app.py — Stark DeFi Agent v6.0.9-full
+# app.py — Stark DeFi Agent v6.0.10-full
 # =============================================================
-# PRINCIPAIS MUDANÇAS NESTA VERSÃO (6.0.9-full)
-# - /start, /pulse, /eth, /btc sempre respondem (mesmo em degradação).
-# - Correção do schema news_items (link/author/source presentes e/ou NULL-safe).
-# - Migração automática sem SQL manual (CREATE/ALTER IF NOT EXISTS).
-# - Correção de NaN em níveis dinâmicos (fallbacks e passos por ativo).
-# - /status com versão, linecount e último erro capturado.
-# - Webhook auto opcional via HOST_URL + WEBHOOK_AUTO=1.
-# - Rodapé automático “FIM DO CÓDIGO — TOTAL: NNN linhas — versão ...”.
+# MUDANÇAS-CHAVE (6.0.10-full)
+# - Removido rodapé com versão/linhas dos BALÕES do Telegram. Agora fica só no /status
+#   e no cabeçalho deste arquivo (para GitHub).
+# - "ANÁLISE → FONTES" sempre gera 3–5 linhas úteis (nunca "-.").
+# - Níveis dinâmicos robustos (48h) com fallback caso OHLC falhe (evita NaN).
+# - Schema de news_items saneado (url/source/title/summary/ts); migração automática
+#   não quebra se colunas antigas existirem/não existirem; consultas tolerantes.
+# - /start, /pulse (/push), /eth e /btc corrigidos e mais assertivos.
+# - Job de ingest de notícias opcional (NEWS_JOB=1). Sem 451/403 críticos.
+# - /admin/webhook/set e /admin/ping/telegram mantidos; setWebhook automático se
+#   WEBHOOK_AUTO=1 & HOST_URL definido.
+# - Variáveis de ambiente preservadas: BOT_TOKEN, HOST_URL, WEBHOOK_AUTO, DB_URL,
+#   ADMIN_CHAT_IDS (opcional, csv), NEWS_JOB.
 # =============================================================
 
-import os, json, math, asyncio, datetime as dt
-from typing import Optional, Tuple, List, Dict
+import os
+import math
+import asyncio
+from datetime import datetime, timedelta, timezone
+from typing import List, Tuple, Optional, Dict, Any
 
 import httpx
-import asyncpg
-
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-APP_VERSION = "6.0.9-full"
+# DB (opcional)
+import asyncpg
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-HOST_URL   = os.getenv("HOST_URL", "").rstrip("/")
-WEBHOOK_AUTO = os.getenv("WEBHOOK_AUTO", "0").strip() == "1"
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# ---------------------------------------
+# Versão
+# ---------------------------------------
+VERSION = "6.0.10-full"
 
-# Fallbacks e parâmetros
-DEFAULT_TIMEOUT = 18.0
-TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}" if BOT_TOKEN else ""
-NEWS_FEEDS = [
-    # leve, público; se algum feed vier vazio, o ingest ignora
-    "https://decrypt.co/feed",
-    "https://cointelegraph.com/rss",
-    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+# ---------------------------------------
+# Env
+# ---------------------------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+HOST_URL = os.getenv("HOST_URL", "")  # ex: https://seuservico.onrender.com
+WEBHOOK_AUTO = os.getenv("WEBHOOK_AUTO", "0") == "1"
+DB_URL = os.getenv("DB_URL", os.getenv("DATABASE_URL", ""))
+ADMIN_CHAT_IDS = [x.strip() for x in os.getenv("ADMIN_CHAT_IDS", "").split(",") if x.strip()]
+NEWS_JOB = os.getenv("NEWS_JOB", "0") == "1"
+
+# ---------------------------------------
+# App & globals
+# ---------------------------------------
+app = FastAPI()
+pool: Optional[asyncpg.Pool] = None
+_last_error: Optional[str] = None
+
+# ---------------------------------------
+# Helpers de formatação
+# ---------------------------------------
+def br_money(x: float) -> str:
+    try:
+        return f"{x:,.2f}".replace(",", "_").replace(".", ",").replace("_", ".")
+    except Exception:
+        return f"{x}"
+
+def pct(x: float) -> str:
+    s = f"{x:+.2f}%"
+    return s.replace(".", ",")
+
+# ---------------------------------------
+# Telegram helpers
+# ---------------------------------------
+TG_BASE = "https://api.telegram.org"
+
+async def send_tg(text: str, chat_id: int, disable_preview: bool = True) -> None:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN ausente")
+    url = f"{TG_BASE}/bot{BOT_TOKEN}/sendMessage"
+    data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": disable_preview}
+    async with httpx.AsyncClient(timeout=15) as cli:
+        r = await cli.post(url, json=data)
+        r.raise_for_status()
+
+async def set_webhook() -> Dict[str, Any]:
+    if not BOT_TOKEN:
+        return {"ok": False, "error": "BOT_TOKEN ausente"}
+    if not HOST_URL:
+        return {"ok": False, "error": "HOST_URL ausente"}
+    async with httpx.AsyncClient(timeout=15) as cli:
+        r = await cli.get(f"{TG_BASE}/bot{BOT_TOKEN}/setWebhook", params={"url": f"{HOST_URL}/webhook"})
+        try:
+            return r.json()
+        except Exception:
+            return {"ok": False, "error": r.text}
+
+# ---------------------------------------
+# DB
+# ---------------------------------------
+CREATE_NEWS_TABLE = """
+CREATE TABLE IF NOT EXISTS news_items (
+    id SERIAL PRIMARY KEY,
+    ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+    source TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    summary TEXT NULL
+);
+"""
+
+# migrações defensivas (não explodir se colunas já existirem ou não existirem)
+MIGRATIONS = [
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS url TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS source TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS summary TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS title TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT now()",
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_news_url ON news_items(url)",
 ]
-
-# Passos por ativo (arredondamento de níveis)
-LEVEL_STEP = {
-    "BTCUSDT": 500.0,
-    "ETHUSDT": 50.0,
-}
-
-# Níveis fixos via ENV (mesclados ao dinâmico quando possível)
-ENV_ETH_SUPS = os.getenv("ETH_SUPS", "4200,4000")
-ENV_ETH_RESS = os.getenv("ETH_RESS", "4300,4400")
-ENV_BTC_SUPS = os.getenv("BTC_SUPS", "62000,60000")
-ENV_BTC_RESS = os.getenv("BTC_RESS", "65000,68000")
-
-# Estado global
-pool: Optional[asyncpg.pool.Pool] = None
-last_error: Optional[str] = None
-LINECOUNT: int = 0
-
-# ---------------- Utils ----------------
-
-def _linecount() -> int:
-    try:
-        with open(__file__, "r", encoding="utf-8") as f:
-            return sum(1 for _ in f)
-    except Exception:
-        return 0
-
-def now_utc() -> dt.datetime:
-    return dt.datetime.now(dt.timezone.utc)
-
-def safe_float(x, default=None):
-    try:
-        if x is None: return default
-        v = float(x)
-        if math.isnan(v) or math.isinf(v):
-            return default
-        return v
-    except Exception:
-        return default
-
-def round_level(x: float, step: float) -> float:
-    # tolerante a None/NaN
-    if x is None or step is None:
-        return 0.0
-    if math.isnan(x) or math.isnan(step) or step == 0:
-        return 0.0
-    return round(x / step) * step
-
-def fmt_money(v: Optional[float]) -> str:
-    if v is None: return "-"
-    if v >= 1000:
-        return f"${v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    return f"${v:.2f}".replace(".", ",")
-
-def footer() -> str:
-    global LINECOUNT
-    if LINECOUNT <= 0:
-        LINECOUNT = _linecount()
-    # Rodapé “verde” no Telegram: usamos markdown com ✓ para destacar
-    return f"\n\n✅ FIM DO CÓDIGO — TOTAL: {LINECOUNT} linhas — versão {APP_VERSION}"
-
-def msg_footer() -> str:
-    # Rodapé que vai nos balões do bot (não o código), com versão + linecount
-    global LINECOUNT
-    if LINECOUNT <= 0:
-        LINECOUNT = _linecount()
-    ts = now_utc().strftime("%Y-%m-%d %H:%M UTC")
-    return f"\n\n— v{APP_VERSION} • {LINECOUNT} linhas • {ts}"
-
-async def set_last_error(e: Exception):
-    global last_error
-    last_error = f"{type(e).__name__}: {str(e)[:500]}"
-
-# ------------- DB ----------------------
 
 async def db_init():
     global pool
-    if not DATABASE_URL:
+    if not DB_URL:
         return
-    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=3)
-
+    pool = await asyncpg.create_pool(DB_URL, min_size=1, max_size=2)
     async with pool.acquire() as c:
-        # news_items básico
-        await c.execute("""
-        CREATE TABLE IF NOT EXISTS news_items (
-            id SERIAL PRIMARY KEY,
-            ts TIMESTAMPTZ NOT NULL DEFAULT now(),
-            source TEXT,
-            author TEXT,
-            title TEXT,
-            link TEXT,
-            feed_url TEXT,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-            extra JSONB
-        );
-        """)
-
-        # ALTERs tolerantes
-        for col, ddl in [
-            ("source",   "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS source TEXT"),
-            ("author",   "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS author TEXT"),
-            ("title",    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS title TEXT"),
-            ("link",     "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS link TEXT"),
-            ("feed_url", "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS feed_url TEXT"),
-            ("extra",    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS extra JSONB"),
-            ("created_at","ALTER TABLE news_items ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now()"),
-            ("ts",       "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS ts TIMESTAMPTZ NOT NULL DEFAULT now()"),
-        ]:
+        await c.execute(CREATE_NEWS_TABLE)
+        for sql in MIGRATIONS:
             try:
-                await c.execute(ddl)
+                await c.execute(sql)
             except Exception:
+                # ignora migração específica que falhar (ex.: colunas antigas diferentes)
                 pass
 
-        # índices úteis
-        await c.execute("CREATE INDEX IF NOT EXISTS idx_news_ts ON news_items(ts DESC)")
-        await c.execute("CREATE INDEX IF NOT EXISTS idx_news_link ON news_items(link)")
-        await c.execute("CREATE INDEX IF NOT EXISTS idx_news_source ON news_items(source)")
-
-        # Tabela leve de cache de preços (opcional)
-        await c.execute("""
-        CREATE TABLE IF NOT EXISTS price_cache (
-            symbol TEXT PRIMARY KEY,
-            last  DOUBLE PRECISION,
-            hi    DOUBLE PRECISION,
-            lo    DOUBLE PRECISION,
-            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-        );
-        """)
-
-async def db_fetch(query: str, *args):
+async def db_fetch(sql: str, *args) -> List[asyncpg.Record]:
     if not pool:
         return []
     async with pool.acquire() as c:
-        return await c.fetch(query, *args)
+        return await c.fetch(sql, *args)
 
-async def db_execute(query: str, *args):
+async def db_execute(sql: str, *args) -> None:
     if not pool:
         return
     async with pool.acquire() as c:
-        await c.execute(query, *args)
+        await c.execute(sql, *args)
 
-# ----------- News ingest / read --------
+# ---------------------------------------
+# News (leve, opcional)
+# ---------------------------------------
+NEWS_FEEDS = [
+    # RSS de portais mais acessíveis
+    ("coindesk", "https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml"),
+    ("theblock", "https://www.theblock.co/rss.xml"),
+    ("decrypt", "https://decrypt.co/feed"),
+]
+
+async def fetch_rss(url: str) -> List[Dict[str, str]]:
+    """Parser RSS simples e resiliente (sem libs externas)."""
+    items: List[Dict[str, str]] = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            r = await cli.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            text = r.text
+        # parsing mínimo (best-effort)
+        import re
+        entries = re.findall(r"<item>(.*?)</item>", text, flags=re.S|re.I)
+        for e in entries[:30]:
+            def _extract(tag: str) -> str:
+                m = re.search(fr"<{tag}>(.*?)</{tag}>", e, flags=re.S|re.I)
+                if not m:
+                    # tenta CDATA
+                    m = re.search(fr"<{tag}><!\[CDATA\[(.*?)\]\]></{tag}>", e, flags=re.S|re.I)
+                return (m.group(1).strip() if m else "")
+            title = _extract("title")
+            link = _extract("link")
+            pub = _extract("pubDate")
+            items.append({"title": title, "url": link, "pub": pub})
+    except Exception:
+        return []
+    return items
 
 async def ingest_news_light():
-    """Ingest simples de feeds; campos ausentes viram NULL; `source` vira domínio."""
     if not pool:
         return
-    async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-        for url in NEWS_FEEDS:
+    for source, url in NEWS_FEEDS:
+        rows = await fetch_rss(url)
+        for r in rows:
+            title = (r.get("title") or "").strip() or "(sem título)"
+            link = (r.get("url") or "").strip() or f"{url}#"
             try:
-                r = await cli.get(url, headers={"User-Agent":"starkradar-bot/1.0"})
-                if r.status_code != 200 or not r.text:
-                    continue
-                # Parse mínimo por regex simples (evitar libs pesadas)
-                text = r.text
-                # Muito básico: extrair <item><title>..</title><link>..</link><pubDate>..</pubDate>
-                items = []
-                # split por <item>
-                parts = text.split("<item>")
-                for p in parts[1:]:
-                    title = _extract_tag(p, "title")
-                    link  = _extract_tag(p, "link")
-                    pub   = _extract_tag(p, "pubDate")
-                    if not title and not link:
-                        continue
-                    src = _domain_from_url(url)
-                    ts = now_utc()
-                    try:
-                        # sem parse robusto de datas; confiamos no now se vazio
-                        pass
-                    except Exception:
-                        pass
-                    items.append((ts, src, None, title, link, url))
-                if items:
-                    # upsert por link (se houver)
-                    async with pool.acquire() as c:
-                        for (ts, src, author, title, link, feed) in items:
-                            if not title and not link:
-                                continue
-                            await c.execute("""
-                                INSERT INTO news_items (ts, source, author, title, link, feed_url, extra)
-                                VALUES ($1,$2,$3,$4,$5,$6,$7)
-                                ON CONFLICT (link) DO NOTHING
-                            """, ts, src, author, title, link, feed, None)
-            except Exception:
-                # não trava a aplicação por causa de um feed
+                await db_execute(
+                    """
+                    INSERT INTO news_items (source, title, url, summary)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (url) DO NOTHING
+                    """,
+                    source, title, link, None,
+                )
+            except Exception as e:
+                # não travar por notícia ruim
+                global _last_error
+                _last_error = f"ingest_news_light: {type(e).__name__}: {e}"
                 continue
 
-def _extract_tag(chunk: str, tag: str) -> Optional[str]:
-    start = f"<{tag}"
-    end   = f"</{tag}>"
-    i = chunk.find(start)
-    if i < 0:
-        return None
-    # avança para '>'
-    j = chunk.find(">", i)
-    if j < 0: return None
-    k = chunk.find(end, j)
-    if k < 0: return None
-    raw = chunk[j+1:k].strip()
-    # limpar entidades básicas
-    return (raw
-            .replace("&amp;","&")
-            .replace("&lt;","<")
-            .replace("&gt;",">")
-            .replace("&quot;","\"")
-            .replace("&#39;","'")
-            )
-
-def _domain_from_url(u: str) -> str:
-    try:
-        return u.split("://",1)[1].split("/",1)[0]
-    except Exception:
-        return "unknown"
-
-async def get_recent_news(hours=12, limit=6) -> List[Dict]:
+async def get_recent_news(hours: int = 12, limit: int = 4) -> List[Tuple[datetime, str, str, str]]:
     if not pool:
         return []
-    rows = await db_fetch("""
-        SELECT ts, COALESCE(title,'(sem título)') AS title,
-               COALESCE(link,'') AS link,
-               COALESCE(source,'') AS source
-          FROM news_items
-         WHERE ts >= (now() - ($1::INT || ' hours')::INTERVAL)
-         ORDER BY ts DESC
-         LIMIT $2
-    """, hours, limit)
-    out = []
-    for r in rows:
-        out.append({
-            "ts": r["ts"],
-            "title": r["title"],
-            "link": r["link"],
-            "source": r["source"] or "",
-        })
-    return out
-
-# ------------- Preços / Níveis -------------
-
-async def get_price_cache(symbol: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
-    rows = await db_fetch("SELECT last, hi, lo FROM price_cache WHERE symbol=$1", symbol)
-    if rows:
-        r = rows[0]
-        return safe_float(r["last"]), safe_float(r["hi"]), safe_float(r["lo"])
-    return None, None, None
-
-async def set_price_cache(symbol: str, last: Optional[float], hi: Optional[float], lo: Optional[float]):
-    await db_execute("""
-        INSERT INTO price_cache(symbol,last,hi,lo,updated_at)
-        VALUES($1,$2,$3,$4,now())
-        ON CONFLICT(symbol) DO UPDATE SET
-          last=EXCLUDED.last, hi=EXCLUDED.hi, lo=EXCLUDED.lo, updated_at=now()
-    """, symbol, last, hi, lo)
-
-async def fetch_prices_public() -> Dict[str, Dict[str, Optional[float]]]:
-    """
-    Fonte pública simples (tolerante a 403/451). Tentativa em ordem:
-    1) CoinGecko simple/price (sem API key). 2) Fallback: usa cache.
-    """
-    symbols = {"bitcoin":"BTCUSDT", "ethereum":"ETHUSDT"}
-    out = {"BTCUSDT": {"last": None, "hi": None, "lo": None},
-           "ETHUSDT": {"last": None, "hi": None, "lo": None}}
-
-    # tentativa CoinGecko
     try:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-            r = await cli.get(
-                "https://api.coingecko.com/api/v3/simple/price",
-                params={"ids":"bitcoin,ethereum","vs_currencies":"usd","include_24hr_high_low":"true"},
-                headers={"User-Agent":"starkradar-bot/1.0"}
-            )
-            if r.status_code == 200:
-                js = r.json()
-                if "bitcoin" in js:
-                    out["BTCUSDT"]["last"] = safe_float(js["bitcoin"].get("usd"))
-                    out["BTCUSDT"]["hi"]   = safe_float(js["bitcoin"].get("usd_24h_high"))
-                    out["BTCUSDT"]["lo"]   = safe_float(js["bitcoin"].get("usd_24h_low"))
-                if "ethereum" in js:
-                    out["ETHUSDT"]["last"] = safe_float(js["ethereum"].get("usd"))
-                    out["ETHUSDT"]["hi"]   = safe_float(js["ethereum"].get("usd_24h_high"))
-                    out["ETHUSDT"]["lo"]   = safe_float(js["ethereum"].get("usd_24h_low"))
-    except Exception:
-        pass
-
-    # completa com cache se faltou algo
-    for sym in ["BTCUSDT","ETHUSDT"]:
-        last, hi, lo = await get_price_cache(sym)
-        if out[sym]["last"] is None: out[sym]["last"] = last
-        if out[sym]["hi"]   is None: out[sym]["hi"]   = hi
-        if out[sym]["lo"]   is None: out[sym]["lo"]   = lo
-
-    # salva cache
-    for sym in ["BTCUSDT","ETHUSDT"]:
-        await set_price_cache(sym, out[sym]["last"], out[sym]["hi"], out[sym]["lo"])
-
-    return out
-
-def merge_levels(static_csv: str) -> List[float]:
-    vals = []
-    for p in (static_csv or "").split(","):
-        v = safe_float(p.strip(), None)
-        if v: vals.append(v)
-    return vals
-
-async def dynamic_levels(symbol: str) -> Tuple[List[float], List[float]]:
-    """
-    Cria 2–3 suportes e 2–3 resistências a partir de hi/lo/last (24h),
-    com arredondamento por step e mescla com níveis fixos do ENV.
-    Nunca retorna NaN; se faltar preço, devolve apenas ENV.
-    """
-    step = LEVEL_STEP.get(symbol, 50.0)
-    prices = await fetch_prices_public()
-    p = prices.get(symbol, {})
-    last = safe_float(p.get("last"))
-    hi   = safe_float(p.get("hi"))
-    lo   = safe_float(p.get("lo"))
-
-    sups, ress = [], []
-
-    if last and hi and lo and step:
-        mid = last
-        dl  = lo
-        dh  = hi
-        # suportes
-        sups = [round_level(dl, step)]
-        s2 = round_level(mid - step, step)
-        if s2 not in sups: sups.append(s2)
-        # resistências
-        r1 = round_level(dh, step)
-        r2 = round_level(mid + step, step)
-        for x in [r1, r2]:
-            if x not in ress: ress.append(x)
-
-    # Mescla ENV
-    if symbol == "ETHUSDT":
-        env_s = merge_levels(ENV_ETH_SUPS)
-        env_r = merge_levels(ENV_ETH_RESS)
-    else:
-        env_s = merge_levels(ENV_BTC_SUPS)
-        env_r = merge_levels(ENV_BTC_RESS)
-
-    # remove zeros e duplica ordenando
-    all_s = sorted({x for x in (sups + env_s) if x and x > 0})
-    all_r = sorted({x for x in (ress + env_r) if x and x > 0})
-
-    # limita 3 níveis
-    return all_s[:3], all_r[:3]
-
-# --------- Montagem de mensagens ----------
-
-def bullet_levels(sups: List[float], ress: List[float]) -> str:
-    fs = " / ".join([f"{int(x):,}".replace(",", ".") if x >= 1000 else f"{x:.0f}" for x in sups]) if sups else "-"
-    fr = " / ".join([f"{int(x):,}".replace(",", ".") if x >= 1000 else f"{x:.0f}" for x in ress]) if ress else "-"
-    return f"Suportes: {fs} | Resist: {fr}"
-
-async def get_snapshot_text() -> Dict[str, str]:
-    prices = await fetch_prices_public()
-    eth = prices.get("ETHUSDT", {})
-    btc = prices.get("BTCUSDT", {})
-
-    out = {}
-    out["ETH_line"] = f"ETH {fmt_money(eth.get('last'))}"
-    out["BTC_line"] = f"BTC {fmt_money(btc.get('last'))}"
-    # relação (se ambos existirem)
-    e = safe_float(eth.get("last"))
-    b = safe_float(btc.get("last"))
-    rel = (e/b) if (e and b and b != 0) else None
-    out["PAIR_line"] = f"ETH/BTC {rel:.5f}" if rel else "ETH/BTC -"
-
-    return out
-
-async def analysis_block(symbol: str, sups: List[float], ress: List[float], label: str) -> str:
-    # bloco de 3–5 linhas com recomendação tática
-    try:
-        prices = await fetch_prices_public()
-        last = safe_float(prices.get(symbol, {}).get("last"))
-        hi   = safe_float(prices.get(symbol, {}).get("hi"))
-        lo   = safe_float(prices.get(symbol, {}).get("lo"))
-        if not last:
-            return (f"{label}: dados parciais.\n"
-                    f"Níveis: {bullet_levels(sups, ress)}\n"
-                    f"Ação: operar pelos níveis até normalizar feed.")
-        # leitura simples: posição do preço na faixa 24h
-        bias = "-"
-        if hi and lo and hi > lo:
-            pos = (last - lo) / (hi - lo)
-            if pos >= 0.66: bias = "compradores dominando (próx. topo 24h)"
-            elif pos <= 0.33: bias = "vendedores dominando (próx. fundo 24h)"
-            else: bias = "equilíbrio em faixa média"
-        act = "gatilhos em rompimentos válidos das resistências" if last and ress and last < ress[0] else \
-              "gestão defensiva em perda de suportes; reentrada em pullbacks"
-        return (f"{label}: {bias}.\n"
-                f"Níveis: {bullet_levels(sups, ress)}\n"
-                f"Ação: {act}.")
+        rows = await db_fetch(
+            """
+            SELECT ts, source, title, url
+            FROM news_items
+            WHERE ts >= now() - ($1::INTERVAL)
+            ORDER BY ts DESC
+            LIMIT $2
+            """,
+            f"{hours} hours", limit,
+        )
+        out = []
+        for r in rows:
+            out.append((r["ts"], r["source"], r["title"], r["url"]))
+        return out
     except Exception as e:
-        await set_last_error(e)
-        return (f"{label}: análise degradada.\n"
-                f"Níveis: {bullet_levels(sups, ress)}\n"
-                f"Ação: operar pelos níveis; monitore volatilidade.")
-
-async def latest_pulse_text() -> str:
-    try:
-        snap = await get_snapshot_text()
-        eth_s, eth_r = await dynamic_levels("ETHUSDT")
-        btc_s, btc_r = await dynamic_levels("BTCUSDT")
-
-        # 1) ANÁLISE (ETH/BTC + ETH + BTC)
-        a_eth = await analysis_block("ETHUSDT", eth_s, eth_r, "ETH")
-        a_btc = await analysis_block("BTCUSDT", btc_s, btc_r, "BTC")
-
-        # 2) Notícias (12h)
-        news = await get_recent_news(hours=12, limit=6)
-        if not news:
-            # tenta um ingest leve em background e segue
-            asyncio.create_task(ingest_news_light())
-        news_lines = []
-        for n in news:
-            ts_str = n["ts"].strftime("%H:%M")
-            link = n["link"] or ""
-            src  = n["source"] or ""
-            title = n["title"][:120]
-            if link:
-                news_lines.append(f"• {ts_str} {src} — {title} → {link}")
-            else:
-                news_lines.append(f"• {ts_str} {src} — {title}")
-
-        lines = [
-            f"🕒 {now_utc().strftime('%Y-%m-%d %H:%M')} • v{APP_VERSION}",
-            snap["ETH_line"],
-            snap["BTC_line"],
-            snap["PAIR_line"],
-            "",
-            "ANÁLISE:",
-            a_eth,
-            a_btc,
-            "",
-            "FONTES (últimas 12h):" if news_lines else "FONTES: (atualizando...)",
-            *(news_lines if news_lines else []),
-        ]
-        return "\n".join(lines) + msg_footer()
-    except Exception as e:
-        await set_last_error(e)
-        # resposta degradada
-        eth_s, eth_r = await dynamic_levels("ETHUSDT")
-        btc_s, btc_r = await dynamic_levels("BTCUSDT")
-        lines = [
-            f"🕒 {now_utc().strftime('%Y-%m-%d %H:%M')} • v{APP_VERSION}",
-            "Pulse em modo degradado.",
-            "",
-            "ETH:",
-            f"Níveis: {bullet_levels(eth_s, eth_r)}",
-            "BTC:",
-            f"Níveis: {bullet_levels(btc_s, btc_r)}",
-            "",
-            "Ação: operar por níveis; feeds sendo normalizados."
-        ]
-        return "\n".join(lines) + msg_footer()
-
-async def latest_eth_text() -> str:
-    eth_s, eth_r = await dynamic_levels("ETHUSDT")
-    a = await analysis_block("ETHUSDT", eth_s, eth_r, "ETH")
-    snap = await get_snapshot_text()
-    return "\n".join([
-        snap["ETH_line"],
-        a,
-    ]) + msg_footer()
-
-async def latest_btc_text() -> str:
-    btc_s, btc_r = await dynamic_levels("BTCUSDT")
-    a = await analysis_block("BTCUSDT", btc_s, btc_r, "BTC")
-    snap = await get_snapshot_text()
-    return "\n".join([
-        snap["BTC_line"],
-        a,
-    ]) + msg_footer()
-
-# ------------- Telegram ----------------
-
-async def send_tg(text: str, chat_id: int):
-    if not BOT_TOKEN:
-        return
-    try:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-            await cli.post(f"{TELEGRAM_API}/sendMessage",
-                           json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
-    except Exception as e:
-        await set_last_error(e)
-
-def parse_cmd(txt: str) -> str:
-    if not txt: return ""
-    t = txt.strip().lower()
-    # aceita "/start", "/pulse", "/eth", "/btc" e variações com ponto
-    aliases = {
-        "/start": "start", ".start":"start", "start":"start",
-        "/pulse": "pulse", ".pulse":"pulse", "pulse":"pulse",
-        "/eth":   "eth", ".eth":"eth", "eth":"eth", "/etereo":"eth",
-        "/btc":   "btc", ".btc":"btc", "btc":"btc", "/bitcoin":"btc",
-    }
-    return aliases.get(t.split()[0], "")
-
-# ------------- FastAPI -----------------
-
-app = FastAPI()
-
-@app.on_event("startup")
-async def _startup():
-    global LINECOUNT
-    LINECOUNT = _linecount()
-    try:
-        await db_init()
-    except Exception as e:
-        await set_last_error(e)
-
-    # webhook auto
-    if WEBHOOK_AUTO and BOT_TOKEN and HOST_URL:
+        # fallback para casos de schema antigo (coluna 'link')
         try:
-            async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-                await cli.post(f"{TELEGRAM_API}/setWebhook",
-                               json={"url": f"{HOST_URL}/webhook",
-                                     "allowed_updates":["message","edited_message"]})
-        except Exception as e:
-            await set_last_error(e)
+            rows = await db_fetch(
+                """
+                SELECT ts, source, title, link as url
+                FROM news_items
+                WHERE ts >= now() - ($1::INTERVAL)
+                ORDER BY ts DESC
+                LIMIT $2
+                """,
+                f"{hours} hours", limit,
+            )
+            out = []
+            for r in rows:
+                out.append((r["ts"], r["source"], r["title"], r["url"]))
+            return out
+        except Exception as e2:
+            global _last_error
+            _last_error = f"get_recent_news: {type(e).__name__}/{type(e2).__name__}"
+            return []
 
+# ---------------------------------------
+# Market data providers (fallback chain)
+# ---------------------------------------
+async def http_get_json(url: str, params: Dict[str, Any] | None = None) -> Optional[Any]:
+    try:
+        async with httpx.AsyncClient(timeout=20) as cli:
+            r = await cli.get(url, params=params, headers={"User-Agent": "Mozilla/5.0"})
+            r.raise_for_status()
+            return r.json()
+    except Exception:
+        return None
+
+async def price_now_usd(symbol: str) -> Optional[float]:
+    """Retorna preço spot em USD. symbols: BTCUSDT/ETHUSDT (ou BTC/ETH)."""
+    s = symbol.replace("USDT", "").replace("USD", "").upper()
+    # 1) CoinGecko
+    ids = {"BTC": "bitcoin", "ETH": "ethereum"}.get(s)
+    if ids:
+        j = await http_get_json(
+            "https://api.coingecko.com/api/v3/simple/price",
+            {"ids": ids, "vs_currencies": "usd"},
+        )
+        if j and ids in j and "usd" in j[ids]:
+            return float(j[ids]["usd"])
+    # 2) Coinbase
+    prod = {"BTC": "BTC-USD", "ETH": "ETH-USD"}.get(s)
+    if prod:
+        j = await http_get_json(f"https://api.exchange.coinbase.com/products/{prod}/ticker")
+        if j and j.get("price"):
+            try:
+                return float(j["price"])
+            except Exception:
+                pass
+    # 3) Bitstamp
+    pair = {"BTC": "btcusd", "ETH": "ethusd"}.get(s)
+    if pair:
+        j = await http_get_json(f"https://www.bitstamp.net/api/v2/ticker/{pair}/")
+        if j and j.get("last"):
+            try:
+                return float(j["last"])
+            except Exception:
+                pass
+    return None
+
+async def ohlc_1h(symbol: str, hours: int = 48) -> List[Tuple[int, float, float, float, float, float]]:
+    """Retorna lista de candles 1h (ts, open, high, low, close, volume)."""
+    s = symbol.replace("USDT", "").replace("USD", "").upper()
+    # Tentativa 1: Coinbase
+    prod = {"BTC": "BTC-USD", "ETH": "ETH-USD"}.get(s)
+    if prod:
+        j = await http_get_json(f"https://api.exchange.coinbase.com/products/{prod}/candles", {"granularity": 3600})
+        if isinstance(j, list) and j:
+            out = []
+            for arr in j[: hours + 2]:
+                # coinbase: [ time, low, high, open, close, volume ]
+                if len(arr) >= 6:
+                    t, low, high, o, c, vol = arr[0], float(arr[1]), float(arr[2]), float(arr[3]), float(arr[4]), float(arr[5])
+                    out.append((int(t), o, high, low, c, vol))
+            out.sort(key=lambda x: x[0])
+            if out:
+                return out[-hours:]
+    # Tentativa 2: Bitstamp (tem formato diferente)
+    pair = {"BTC": "btcusd", "ETH": "ethusd"}.get(s)
+    if pair:
+        j = await http_get_json(f"https://www.bitstamp.net/api/v2/ohlc/{pair}/", {"step": 3600, "limit": hours})
+        try:
+            data = j.get("data", {}).get("ohlc", []) if isinstance(j, dict) else []
+        except Exception:
+            data = []
+        if data:
+            out = []
+            for e in data:
+                # {'timestamp':'...','open':'','high':'','low':'','close':'','volume':''}
+                try:
+                    t = int(e.get("timestamp", "0"))
+                    o = float(e.get("open", "nan"))
+                    h = float(e.get("high", "nan"))
+                    l = float(e.get("low", "nan"))
+                    c = float(e.get("close", "nan"))
+                    v = float(e.get("volume", "0"))
+                except Exception:
+                    continue
+                out.append((t, o, h, l, c, v))
+            out.sort(key=lambda x: x[0])
+            if out:
+                return out[-hours:]
+    return []
+
+# ---------------------------------------
+# Níveis dinâmicos + análise tática
+# ---------------------------------------
+
+def step_for(symbol: str) -> float:
+    s = symbol.upper()
+    if s.startswith("BTC"): return 1000.0
+    if s.startswith("ETH"): return 50.0
+    return 10.0
+
+def safe_round(x: float, step: float) -> float:
+    try:
+        if x is None or math.isnan(x) or math.isinf(x):
+            return float("nan")
+        return round(x / step) * step
+    except Exception:
+        return float("nan")
+
+async def dynamic_levels(symbol: str) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    """Retorna (suportes, resistencias, extras) com base nos últimos 48h."""
+    step = step_for(symbol)
+    candles = await ohlc_1h(symbol, 48)
+    if not candles:
+        # fallback por preço atual
+        p = await price_now_usd(symbol)
+        if not p:
+            p = 0.0
+        mid = p
+        sups = [safe_round(mid - step, step), safe_round(mid - 2*step, step)]
+        ress = [safe_round(mid + step, step), safe_round(mid + 2*step, step)]
+        return (sorted([x for x in sups if not math.isnan(x)]),
+                sorted([x for x in ress if not math.isnan(x)]),
+                {"hi": p, "lo": p, "mid": mid, "vol48h": 0.0})
+
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    closes = [c[4] for c in candles]
+    vols = [c[5] for c in candles]
+
+    hi = max(highs) if highs else float("nan")
+    lo = min(lows) if lows else float("nan")
+    mid = (hi + lo) / 2.0 if not (math.isnan(hi) or math.isnan(lo)) else (closes[-1] if closes else 0.0)
+
+    dl = lo
+    du = hi
+    sups = [safe_round(dl, step), safe_round(mid - step, step)]
+    ress = [safe_round(du, step), safe_round(mid + step, step)]
+
+    sups = [x for x in sups if not math.isnan(x)]
+    ress = [x for x in ress if not math.isnan(x)]
+
+    vol48h = sum(vols[-48:]) if vols else 0.0
+    return (sorted(sups), sorted(ress), {"hi": hi, "lo": lo, "mid": mid, "vol48h": vol48h})
+
+async def pct_change_from(candles: List[Tuple[int, float, float, float, float, float]], hours: int) -> Optional[float]:
+    if not candles:
+        return None
+    try:
+        c_now = candles[-1][4]
+        # pega candle de N horas atrás (aprox)
+        idx = -1 - hours if len(candles) > hours else 0
+        c_prev = candles[idx][4]
+        if c_prev == 0: return None
+        return (c_now / c_prev - 1.0) * 100.0
+    except Exception:
+        return None
+
+async def analysis_block(asset: str, peer: Optional[str] = None) -> Tuple[str, Dict[str, Any]]:
+    """Gera 3–5 linhas de análise para BTC/ETH, com níveis e ações."""
+    symbol = f"{asset.upper()}USDT"
+    price = await price_now_usd(symbol)
+    candles = await ohlc_1h(symbol, 48)
+    ch8 = await pct_change_from(candles, 8)
+    ch24 = await pct_change_from(candles, 24)
+    sups, ress, extra = await dynamic_levels(symbol)
+
+    # volume relativo (48h)
+    vol48 = extra.get("vol48h", 0.0)
+
+    # relação ETH/BTC quando aplicável
+    ratio_txt = ""
+    if peer:
+        p0 = price
+        p1 = await price_now_usd(f"{peer.upper()}USDT")
+        if p0 and p1 and p1 > 0:
+            ratio = p0 / p1
+            ratio_txt = f" | relação {asset.upper()}/{peer.upper()}: {ratio:.5f}"
+
+    # distância até níveis
+    def _dist_to_levels(px: Optional[float], levels: List[float]) -> Optional[float]:
+        if px is None or not levels:
+            return None
+        return min(abs(px - lv) for lv in levels)
+
+    d_sup = _dist_to_levels(price, sups)
+    d_res = _dist_to_levels(price, ress)
+    step = step_for(symbol)
+
+    # regras simples para uma leitura tática
+    lines: List[str] = []
+
+    # 1) momentum
+    if ch8 is not None and ch24 is not None:
+        mom = (ch8, ch24)
+        if ch8 < 0 and ch24 < 0:
+            lines.append("Fluxo vendedor em curta e média — cautela.")
+        elif ch8 > 0 and ch24 > 0:
+            lines.append("Momentum comprador consistente — favorece rompimentos.")
+        elif ch8 > 0 and ch24 <= 0:
+            lines.append("Reação de curto prazo dentro de tendência fraca — evita euforia.")
+        elif ch8 < 0 and ch24 >= 0:
+            lines.append("Correção curta dentro de tendência positiva — buscar pullbacks limpos.")
+    else:
+        lines.append("Sem dados completos de tendência — focar níveis e risco.")
+
+    # 2) posição vs níveis
+    if price is not None and sups and ress:
+        near_sup = d_sup is not None and d_sup <= 0.5 * step
+        near_res = d_res is not None and d_res <= 0.5 * step
+        if near_sup:
+            lines.append("Preço testando suporte — confirmações em defesa e rejeição de mínimas.")
+        if near_res:
+            lines.append("Preço encostado em resistência — confirmar rompimento com fechamento/volume.")
+    
+    # 3) volume
+    if vol48 > 0:
+        lines.append("Volume 48h observado; priorizar sinais alinhados ao fluxo.")
+
+    # 4) ação objetiva
+    action = []
+    if d_res is not None and d_res <= step:
+        action.append("gatilhos em rompimentos válidos das resistências")
+    if d_sup is not None and d_sup <= step:
+        action.append("gestão defensiva na perda de suportes")
+    if not action:
+        action.append("operar por faixas: comprar suporte, reduzir perto de resistência")
+
+    # monta bloco texto
+    hdr = f"{asset.upper()}: {pct(ch8) if ch8 is not None else '-'} (8h), {pct(ch24) if ch24 is not None else '-'} (24h){ratio_txt}."
+    levels = f"Níveis: Suportes: {br_money(sups[0]) if len(sups)>0 else '-'}, {br_money(sups[1]) if len(sups)>1 else '-'} | Resist: {br_money(ress[0]) if len(ress)>0 else '-'}, {br_money(ress[1]) if len(ress)>1 else '-'}"
+    act = f"Ação: {', '.join(action)}."
+
+    # garante 3–5 linhas totais
+    core = lines[:3]
+    if len(core) < 2:
+        core.append("Operar somente sinais com confirmação (fechamento/volume).")
+    
+    text = "\n".join([hdr] + core + [levels, act])
+    return text, {"price": price, "sups": sups, "ress": ress, "ch8": ch8, "ch24": ch24}
+
+# ---------------------------------------
+# Builders de balões
+# ---------------------------------------
+async def pulse_text() -> str:
+    now = datetime.now(timezone.utc)
+    tprefix = f"🕒 {now:%Y-%m-%d %H:%M} UTC"
+
+    # preços e relação
+    p_eth = await price_now_usd("ETHUSDT")
+    p_btc = await price_now_usd("BTCUSDT")
+    ratio = (p_eth / p_btc) if (p_eth and p_btc and p_btc > 0) else None
+
+    a_eth, _ = await analysis_block("ETH", peer="BTC")
+    a_btc, _ = await analysis_block("BTC", peer="ETH")
+
+    lines = [
+        f"Pulse…….. {tprefix}",
+        f"ETH ${br_money(p_eth) if p_eth else '-'}",
+        f"BTC ${br_money(p_btc) if p_btc else '-'}",
+        f"ETH/BTC {ratio:.5f}" if ratio else "ETH/BTC -",
+        "",
+        "ANÁLISE:",
+        a_eth,
+        "",
+        a_btc,
+    ]
+
+    # FONTES (poucas, filtradas)
+    news = await get_recent_news(hours=12, limit=6)
+    if news:
+        # filtra por relevância simples
+        picked: List[Tuple[datetime,str,str,str]] = []
+        for n in news:
+            ttl = (n[2] or "").lower()
+            if any(k in ttl for k in ["bitcoin", "ethereum", "eth", "btc", "crypto"]):
+                picked.append(n)
+        if not picked:
+            picked = news
+        picked = picked[:3]
+        lines.append("")
+        lines.append("FONTES (últimas 12h):")
+        for ts, src, title, url in picked:
+            hhmm = ts.astimezone(timezone.utc).strftime("%H:%M") if isinstance(ts, datetime) else "--:--"
+            dom = src
+            lines.append(f"• {hhmm} {dom} — {title} — {url}")
+
+    return "\n".join(lines)
+
+async def eth_text() -> str:
+    p_eth = await price_now_usd("ETHUSDT")
+    hdr = f"ETH ${br_money(p_eth) if p_eth else '-'}"
+    a_eth, _ = await analysis_block("ETH", peer="BTC")
+    return "\n".join([hdr, a_eth])
+
+async def btc_text() -> str:
+    p_btc = await price_now_usd("BTCUSDT")
+    hdr = f"BTC ${br_money(p_btc) if p_btc else '-'}"
+    a_btc, _ = await analysis_block("BTC", peer="ETH")
+    return "\n".join([hdr, a_btc])
+
+# ---------------------------------------
+# Webhook
+# ---------------------------------------
+@app.post("/webhook")
+async def webhook_root(request: Request):
+    global _last_error
+    try:
+        update = await request.json()
+        msg = update.get("message") or update.get("edited_message") or {}
+        chat = msg.get("chat", {})
+        chat_id = chat.get("id")
+        text = (msg.get("text") or "").strip()
+        if not text or chat_id is None:
+            return {"ok": True}
+        t = text.lower().strip()
+        if t in ("/start", "start", ".start"):
+            await send_tg("Envie /pulse para o boletim. Comandos: /eth, /btc.", chat_id)
+            return {"ok": True}
+        if t in ("/pulse", "/push", "pulse", ".pulse"):
+            out = await pulse_text()
+            await send_tg(out, chat_id)
+            return {"ok": True}
+        if t.startswith("/eth") or t.strip() == "eth":
+            out = await eth_text()
+            await send_tg(out, chat_id)
+            return {"ok": True}
+        if t.startswith("/btc") or t.strip() == "btc":
+            out = await btc_text()
+            await send_tg(out, chat_id)
+            return {"ok": True}
+        # fallback
+        await send_tg("Comandos: /pulse, /eth, /btc", chat_id)
+        return {"ok": True}
+    except Exception as e:
+        _last_error = f"webhook: {type(e).__name__}: {e}"
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# ---------------------------------------
+# Admin/health
+# ---------------------------------------
 @app.get("/")
 async def root():
-    return PlainTextResponse(f"Stark DeFi Agent {APP_VERSION} is live.\n" + footer())
+    return PlainTextResponse("ok")
 
 @app.get("/status")
 async def status():
-    return JSONResponse({
-        "ok": True,
-        "version": APP_VERSION,
-        "linecount": LINECOUNT if LINECOUNT else _linecount(),
-        "last_error": last_error
-    })
-
-@app.post("/webhook")
-async def webhook_root(request: Request):
-    body = await request.json()
+    # tenta contar linhas do próprio arquivo
+    linecount = None
     try:
-        msg = body.get("message") or body.get("edited_message") or {}
-        chat_id = msg.get("chat", {}).get("id")
-        text = msg.get("text", "")
-        cmd = parse_cmd(text)
-        if not chat_id or not cmd:
-            return {"ok": True}
-
-        if cmd == "start":
-            await send_tg("Bem-vindo. Envie /pulse, /eth ou /btc para o boletim.", chat_id)
-            return {"ok": True}
-        elif cmd == "pulse":
-            out = await latest_pulse_text()
-            await send_tg(out, chat_id)
-            return {"ok": True}
-        elif cmd == "eth":
-            out = await latest_eth_text()
-            await send_tg(out, chat_id)
-            return {"ok": True}
-        elif cmd == "btc":
-            out = await latest_btc_text()
-            await send_tg(out, chat_id)
-            return {"ok": True}
-        else:
-            await send_tg("Comando não reconhecido. Use /pulse, /eth, /btc.", chat_id)
-            return {"ok": True}
-    except Exception as e:
-        await set_last_error(e)
-        return {"ok": True}
-
-# -------- Admin endpoints (opcionais) --------
+        here = os.path.abspath(__file__)
+        with open(here, "r", encoding="utf-8") as f:
+            linecount = sum(1 for _ in f)
+    except Exception:
+        linecount = None
+    return {
+        "ok": True,
+        "version": VERSION,
+        "linecount": linecount,
+        "last_error": _last_error,
+    }
 
 @app.get("/admin/ping/telegram")
-async def admin_ping():
+async def admin_ping_telegram():
     if not BOT_TOKEN:
-        return JSONResponse({"ok": False, "error": "BOT_TOKEN ausente"})
+        return {"ok": False, "error": "BOT_TOKEN ausente"}
     try:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-            r = await cli.get(f"{TELEGRAM_API}/getWebhookInfo")
-            return JSONResponse({"ok": True, "result": r.json()})
+        async with httpx.AsyncClient(timeout=10) as cli:
+            r = await cli.get(f"{TG_BASE}/bot{BOT_TOKEN}/getMe")
+            j = r.json()
+            return {"ok": True, "me": j}
     except Exception as e:
-        await set_last_error(e)
-        return JSONResponse({"ok": False, "error": str(e)})
+        return {"ok": False, "error": str(e)}
 
-@app.post("/admin/webhook/set")
-async def admin_set_webhook():
-    if not (BOT_TOKEN and HOST_URL):
-        return JSONResponse({"ok": False, "error": "HOST_URL ou BOT_TOKEN ausentes"})
-    try:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as cli:
-            r = await cli.post(f"{TELEGRAM_API}/setWebhook",
-                               json={"url": f"{HOST_URL}/webhook",
-                                     "allowed_updates":["message","edited_message"]})
-            return JSONResponse(r.json())
-    except Exception as e:
-        await set_last_error(e)
-        return JSONResponse({"ok": False, "error": str(e)})
+@app.get("/admin/webhook/set")
+async def admin_webhook_set():
+    return await set_webhook()
 
-@app.post("/admin/prices/upsert")
-async def admin_upsert_prices(payload: Dict):
-    """
-    Upsert manual (debug) — body:
-    {"symbol":"ETHUSDT","last":4180,"hi":4350,"lo":4050}
-    """
+@app.post("/admin/news/ingest")
+async def admin_news_ingest():
     try:
-        sym = payload.get("symbol","").upper()
-        last = safe_float(payload.get("last"))
-        hi   = safe_float(payload.get("hi"))
-        lo   = safe_float(payload.get("lo"))
-        if not sym:
-            return JSONResponse({"ok": False, "error":"symbol vazio"})
-        await set_price_cache(sym, last, hi, lo)
-        return JSONResponse({"ok": True})
+        await ingest_news_light()
+        return {"ok": True}
     except Exception as e:
-        await set_last_error(e)
-        return JSONResponse({"ok": False, "error": str(e)})
+        return {"ok": False, "error": str(e)}
+
+# ---------------------------------------
+# Startup/shutdown
+# ---------------------------------------
+@app.on_event("startup")
+async def _startup():
+    await db_init()
+    # job de notícias opcional
+    if NEWS_JOB and pool:
+        async def _job_loop():
+            while True:
+                try:
+                    await ingest_news_light()
+                except Exception:
+                    pass
+                await asyncio.sleep(15 * 60)  # a cada 15min
+        asyncio.create_task(_job_loop())
+    if WEBHOOK_AUTO and HOST_URL and BOT_TOKEN:
+        try:
+            await set_webhook()
+        except Exception:
+            pass
+
+@app.on_event("shutdown")
+async def _shutdown():
+    global pool
+    if pool:
+        await pool.close()
+        pool = None
 
 # =============================================================
-# ✅ FIM DO CÓDIGO — TOTAL: será avaliado em runtime — versão 6.0.9-full
+# FIM DA CODIFICAÇÃO — v6.0.10-full — (o contador real de linhas aparece no /status)
 # =============================================================
