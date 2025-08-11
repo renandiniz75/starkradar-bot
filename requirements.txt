@@ -1,15 +1,31 @@
+# Web/API
 fastapi==0.115.0
-uvicorn==0.30.1
-httpx==0.27.2
-python-dotenv==1.0.1
-asyncpg==0.29.0
-APScheduler==3.10.4
-pydantic==2.11.7
 starlette==0.38.6
-typing-extensions==4.14.1
-tzlocal==5.3.1
-pytz==2025.2
-# --- opcional para /panel (gráficos) ---
-matplotlib==3.9.2
-pillow==10.4.0
+pydantic==2.11.7
+uvicorn[standard]==0.30.6
+
+# HTTP / assíncrono
+httpx>=0.25,<0.28
+aiohttp==3.9.5
+anyio==4.10.0
+python-dotenv==1.0.1
+
+# DB (opcional, mas já deixa pronto)
+asyncpg==0.29.0
+
+# News parsing
+beautifulsoup4==4.12.3
+lxml==5.2.1
+
+# Cotações/derivativos (futuras integrações)
+ccxt==4.2.84
+
+# Painel/plot (opcional; /panel falha graciosamente se faltar)
 numpy==1.26.4
+matplotlib==3.9.2
+Pillow==10.4.0
+pandas==2.2.2
+
+# Utilitários
+requests==2.31.0
+loguru==0.7.2
