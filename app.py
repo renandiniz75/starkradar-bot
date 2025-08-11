@@ -1,11 +1,11 @@
-# app.py — Stark DeFi Agent v6.0.5
-# - /eth e /btc com mini-pulso + S/R + gatilhos + sparkline (2h)
-# - /pulse com diagramação em "balão"
-# - /alpha com síntese de notícias (RSS leve)
-# - Spot primário: Coinbase; fallbacks: Bybit/Coingecko
-# - Whales via Coinbase (OPCIONAL, com cooldown, sem spam)
-# - Sem chamadas à Binance
-# - Tolerância a erros e logs limpos
+# app.py — Stark DeFi Agent v6.0.6
+# Changelog:
+# - /version para confirmar runtime (APP_VERSION)
+# - Webhook robusto: aceita /webhook e /webhook/{qualquer_coisa}, inclusive token URL-encoded
+# - Removida qualquer referência à Binance
+# - /pulse, /alpha, /eth, /btc com sparkline + S/R + síntese 8h
+# - /run/news e /run/ingest para disparo manual
+# - Logs de boot com versão e toggles
 
 import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, re
 import datetime as dt
@@ -16,6 +16,8 @@ import httpx
 import asyncpg
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
+
+APP_VERSION = "6.0.6"
 
 # ===================== Config =====================
 TZ = ZoneInfo(os.getenv("TZ", "America/Sao_Paulo"))
@@ -30,12 +32,12 @@ BYBIT_KEY = os.getenv("BYBIT_RO_KEY", "")
 BYBIT_SEC = os.getenv("BYBIT_RO_SECRET", "")
 BYBIT_ACCOUNT_TYPE = os.getenv("BYBIT_ACCOUNT_TYPE", "UNIFIED")
 
-# Coinbase whales opcional
+# Coinbase whales opcional (desligado por padrão)
 COINBASE_WHALES = os.getenv("COINBASE_WHALES", "0") == "1"
-WHALE_USD_MIN = float(os.getenv("WHALE_USD_MIN", "750000"))  # ↑ um pouco p/ evitar ruído
+WHALE_USD_MIN = float(os.getenv("WHALE_USD_MIN", "750000"))
 WHALE_COOLDOWN_SEC = int(os.getenv("WHALE_COOLDOWN_SEC", "60"))
 
-# On-chain opcional (endereços, etherscan)
+# On-chain opcional
 AAVE_ADDR = os.getenv("AAVE_ADDR", "")
 ETHERSCAN_API_KEY = os.getenv("ETHERSCAN_API_KEY", "")
 
@@ -75,6 +77,7 @@ last_run = {
     "news": None
 }
 _last_whale_emit = 0
+_last_trade_id = None
 
 # ===================== SQL =====================
 CREATE_SQL = """
@@ -187,7 +190,6 @@ def pct(a: float, b: float) -> float:
     return (b-a)/a*100.0
 
 def sparkline(vals: List[float]) -> str:
-    # Unicode blocks: ▁▂▃▄▅▆▇█
     if not vals or all(v is None for v in vals): return ""
     clean=[float(v) for v in vals if v is not None]
     if not clean: return ""
@@ -204,7 +206,6 @@ def sparkline(vals: List[float]) -> str:
     return "".join(out)
 
 def balloon(title: str, lines: List[str]) -> str:
-    # Caixa bonitinha para Telegram (monospace)
     body = "\n".join(lines)
     top = f"┌─ {title} ────────────────────"
     bot = "└────────────────────────────"
@@ -215,16 +216,13 @@ async def get_coinbase_pair(pair: str) -> Tuple[Optional[float], Optional[float]
     try:
         j = await fetch_json(COINBASE_TICKER.format(pair=pair))
         price = float(j.get("price") or j.get("last") or j.get("ask") or 0)
-        # Coinbase ticker não traz H/L intradiário → deixamos None
         return price, None, None
     except Exception:
         return None, None, None
 
 async def get_spot_snapshot() -> dict:
-    # 1) Coinbase
     ep, eh, el = await get_coinbase_pair("ETH-USD")
     bp, bh, bl = await get_coinbase_pair("BTC-USD")
-    # 2) Bybit (spot) p/ H/L quando possível
     try:
         if ep is None or eh is None or el is None:
             eth = (await fetch_json(BYBIT_SPOT.format(sym="ETHUSDT")))["result"]["list"][0]
@@ -239,7 +237,6 @@ async def get_spot_snapshot() -> dict:
             bh = float(btc["highPrice"]); bl = float(btc["lowPrice"])
     except Exception:
         pass
-    # 3) Coingecko fallback
     if ep is None or bp is None:
         try:
             cg = await fetch_json("https://api.coingecko.com/api/v3/simple/price?ids=ethereum,bitcoin&vs_currencies=usd")
@@ -301,17 +298,13 @@ async def ingest_1m():
     finally:
         last_run["ingest_1m"] = now_tz()
 
-_last_trade_id = None
 async def ingest_whales_coinbase():
-    """Agrega trades recentes da Coinbase e emite alerta somente se BUY/SELL >= WHALE_USD_MIN, com cooldown."""
     global _last_trade_id, _last_whale_emit
-    if not COINBASE_WHALES: 
-        last_run["ingest_whales"] = now_tz()
-        return
+    if not COINBASE_WHALES:
+        last_run["ingest_whales"] = now_tz(); return
     try:
         j = await fetch_json_retry(COINBASE_TRADES.format(pair="ETH-USD"), attempts=2, timeout=8.0)
         trades = j if isinstance(j, list) else []
-        # Coinbase retorna lista com 'trade_id', 'price','size','side'
         new=[]
         top_seen = _last_trade_id
         for t in trades:
@@ -320,8 +313,7 @@ async def ingest_whales_coinbase():
                 new.append(t)
                 if top_seen is None or tid>top_seen: top_seen=tid
         if not new:
-            last_run["ingest_whales"] = now_tz()
-            return
+            last_run["ingest_whales"] = now_tz(); return
         buy_usd=sell_usd=0.0; buy_qty=sell_qty=0.0
         for t in new:
             price=float(t.get("price",0)); qty=float(t.get("size",0))
@@ -330,10 +322,9 @@ async def ingest_whales_coinbase():
             if side=="BUY":  buy_usd+=usd; buy_qty+=qty
             else:            sell_usd+=usd; sell_qty+=qty
         _last_trade_id = top_seen
-        now = time.time()
-        if now - _last_whale_emit < WHALE_COOLDOWN_SEC:
-            last_run["ingest_whales"] = now_tz()
-            return
+        nowsec = time.time()
+        if nowsec - _last_whale_emit < WHALE_COOLDOWN_SEC:
+            last_run["ingest_whales"] = now_tz(); return
         events=[]
         if buy_usd>=WHALE_USD_MIN: events.append(("BUY", buy_qty,  buy_usd,  f"agg {len(new)} trades CB"))
         if sell_usd>=WHALE_USD_MIN: events.append(("SELL", sell_qty, sell_usd, f"agg {len(new)} trades CB"))
@@ -347,7 +338,7 @@ async def ingest_whales_coinbase():
                     )
             for side, qty, usd, note in events:
                 await send_tg(f"🐋 {side} ~ ${usd:,.0f} | qty ~ {qty:,.1f} • {note}")
-            _last_whale_emit = now
+            _last_whale_emit = nowsec
     finally:
         last_run["ingest_whales"] = now_tz()
 
@@ -468,22 +459,20 @@ async def ingest_news():
         try:
             txt = await fetch_text(src.strip(), timeout=8.0)
             for m in NEWS_RE.findall(txt):
-                title=_clean_xml(m[0])
-                url=_clean_xml(m[1])
+                title=_clean_xml(m[0]); url=_clean_xml(m[1])
                 ttitle=title.lower()
                 if any(tag in ttitle for tag in NEWSTAGS):
                     items.append(("rss", title[:300], url[:400]))
         except Exception:
             pass
-    if not items:
-        last_run["news"] = now_tz(); return
-    ts = dt.datetime.now(dt.UTC)
-    async with pool.acquire() as c:
-        for _, title, url in items[:30]:
-            await c.execute("INSERT INTO news_items(ts,source,title,url) VALUES($1,$2,$3,$4)", ts, "rss", title, url)
+    if items:
+        ts = dt.datetime.now(dt.UTC)
+        async with pool.acquire() as c:
+            for _, title, url in items[:30]:
+                await c.execute("INSERT INTO news_items(ts,source,title,url) VALUES($1,$2,$3,$4)", ts, "rss", title, url)
     last_run["news"] = now_tz()
 
-# ===================== Commentary builders =====================
+# ===================== Commentary =====================
 async def load_series(symbol: str, minutes: int=120) -> List[float]:
     start = dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes)
     async with pool.acquire() as c:
@@ -494,7 +483,6 @@ async def load_series(symbol: str, minutes: int=120) -> List[float]:
     return [float(r["close"]) if r["close"] is not None else None for r in rows]
 
 def zones_for_eth(p: float) -> Tuple[List[str], List[str]]:
-    # S/R sugeridas rápidas (ajuste fino depois se quiser parametrizar)
     supports=[]; res=[]
     for lvl in [4200, 4000, 3850, 3700]:
         if p is not None and p>lvl: supports.append(f"{lvl:.0f}")
@@ -505,7 +493,7 @@ def zones_for_eth(p: float) -> Tuple[List[str], List[str]]:
 def zones_for_btc(p: float) -> Tuple[List[str], List[str]]:
     supports=[]; res=[]
     for lvl in [116000, 112000, 108000, 104000]:
-        if p is not None and p>lvl: supports.append(f"{lvl:,}".replace(",","."))  # pt-BR style
+        if p is not None and p>lvl: supports.append(f"{lvl:,}".replace(",",".")) 
     for lvl in [120000, 124000, 128000]:
         if p is not None and p<lvl: res.append(f"{lvl:,}".replace(",","."))
     return supports[:3], res[:3]
@@ -527,7 +515,6 @@ async def build_commentary_8h() -> str:
     flow = "neutra"
     if buy>sell*1.3: flow="compradora"
     elif sell>buy*1.3: flow="vendedora"
-    # Notícias → frase curtinha
     news_hint = ""
     if news:
         headlines = [n["title"] for n in news][:3]
@@ -537,7 +524,6 @@ async def build_commentary_8h() -> str:
     synth.append(f"BTC: {btc_chg:+.2f}%/8h; {'beta menor que ETH' if ratio_chg>0 else 'dominância em alta'}.")
     synth.append(f"ETH/BTC: {ratio_chg:+.2f}%/8h; " + ("ETH com força relativa." if ratio_chg>0 else "BTC comandando o ritmo."))
     if news_hint: synth.append(f"News: {news_hint}")
-    # Nota tática
     if ratio_chg>0 and (funding is None or funding<0.0006):
         synth.append("Leitura: pró-ETH (força relativa + funding contido).")
     elif funding is not None and funding>0.0012:
@@ -566,13 +552,10 @@ async def latest_pulse_text() -> str:
     now = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     eth = float(m["eth_usd"]); btc = float(m["btc_usd"]); ratio = float(m["eth_btc_ratio"])
     eh, el, bh, bl = e["high"], e["low"], b["high"], b["low"]
-
-    # Sparkline
     eth_series = await load_series("ETHUSDT", 120)
     btc_series = await load_series("BTCUSDT", 120)
     s_eth = sparkline(eth_series[-60:])
     s_btc = sparkline(btc_series[-60:])
-
     parts=[
         f"🕒 {now}",
         f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if isinstance(eh,(int,float)) and isinstance(el,(int,float)) else ""),
@@ -581,15 +564,7 @@ async def latest_pulse_text() -> str:
     ]
     if d and d["funding"] is not None: parts.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
     if d and d["open_interest"] is not None: parts.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
-
-    box = balloon("PULSE",
-        [
-          f"📈 ETH  {s_eth}",
-          f"₿  BTC  {s_btc}",
-          "",
-          action_line(eth),
-        ]
-    )
+    box = balloon("PULSE", [f"📈 ETH  {s_eth}", f"₿  BTC  {s_btc}", "", action_line(eth)])
     comment = await build_commentary_8h()
     return "\n".join(parts) + "\n\n" + box + "\n" + comment
 
@@ -605,13 +580,11 @@ def mini_pulse_asset(name: str, price: Optional[float], ch8h: Optional[float], e
     return "\n".join([l for l in lines if l])
 
 async def asset_card(symbol: str) -> str:
-    # symbol: "ETHUSDT" ou "BTCUSDT"
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=8)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT ts, close, high, low FROM candles_minute WHERE symbol=$1 AND ts BETWEEN $2 AND $3 ORDER BY ts", symbol, start, end)
-        m = await c.fetchrow("SELECT * FROM market_rel ORDER BY ts DESC LIMIT 1")
         d = await c.fetchrow("SELECT * FROM derivatives_snap WHERE symbol='ETHUSDT' AND exchange='bybit' ORDER BY ts DESC LIMIT 1")
-    if not rows or not m:
+    if not rows:
         return "⏳ Aguardando histórico…"
     prices = [float(r["close"]) for r in rows if r["close"] is not None]
     if not prices: return "⏳ Aguardando histórico…"
@@ -639,6 +612,7 @@ async def asset_card(symbol: str) -> str:
 # ===================== FastAPI =====================
 @app.on_event("startup")
 async def _startup():
+    print(f"[BOOT] Stark DeFi Agent {APP_VERSION}  | TZ={TZ}  | COINBASE_WHALES={COINBASE_WHALES}  | NEWS={'off' if DISABLE_NEWS else 'on'}")
     await db_init()
     scheduler.add_job(ingest_1m, "interval", minutes=1, id="ingest_1m", replace_existing=True, max_instances=1)
     if COINBASE_WHALES:
@@ -649,14 +623,27 @@ async def _startup():
     if not DISABLE_NEWS:
         scheduler.add_job(ingest_news, "interval", minutes=15, id="ingest_news", replace_existing=True, max_instances=1)
     # Boletins (08,14,20)
-    scheduler.add_job(lambda: send_tg(asyncio.run(latest_pulse_text())), "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
-    scheduler.add_job(lambda: send_tg(asyncio.run(latest_pulse_text())), "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
-    scheduler.add_job(lambda: send_tg(asyncio.run(latest_pulse_text())), "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
+    scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
     scheduler.start()
+
+async def send_pulse_to_chat():
+    await send_tg(await latest_pulse_text())
 
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "time": now_tz()}
+    return {"ok": True, "time": now_tz(), "version": APP_VERSION}
+
+@app.get("/version")
+async def version():
+    return {
+        "version": APP_VERSION,
+        "toggles": {
+            "COINBASE_WHALES": COINBASE_WHALES,
+            "DISABLE_NEWS": DISABLE_NEWS
+        }
+    }
 
 @app.get("/status")
 async def status():
@@ -674,13 +661,24 @@ async def status():
             "derivatives": ds, "whale_events": whales, "account_snap": acc,
             "news": news,
         },
-        "last_run": last_run
+        "last_run": last_run,
+        "version": APP_VERSION
     }
 
 @app.post("/run/accounts")
 async def run_accounts():
     await ingest_accounts()
     return {"ok": True, "ran_at": last_run["ingest_accounts"]}
+
+@app.post("/run/news")
+async def run_news():
+    await ingest_news()
+    return {"ok": True, "ran_at": last_run["news"]}
+
+@app.post("/run/ingest")
+async def run_ingest():
+    await ingest_1m()
+    return {"ok": True, "ran_at": last_run["ingest_1m"]}
 
 @app.get("/pulse")
 async def pulse():
@@ -723,9 +721,7 @@ async def export_strats():
     return PlainTextResponse(buf.getvalue(), media_type="text/csv")
 
 # ===================== Telegram Webhook =====================
-@app.post("/webhook")
-@app.post("/webhook/{token}")
-async def telegram_webhook(request: Request, token: Optional[str]=None):
+async def _process_update(request: Request) -> Dict[str, Any]:
     try: update = await request.json()
     except Exception: return {"ok": True}
     msg = update.get("message") or update.get("edited_message") or update.get("channel_post")
@@ -734,7 +730,6 @@ async def telegram_webhook(request: Request, token: Optional[str]=None):
     text = (msg.get("text") or "").strip()
     low = text.lower()
 
-    # Comandos
     if low in ("/start","start"):
         await send_tg(
             "✅ Bot online.\n"
@@ -752,13 +747,10 @@ async def telegram_webhook(request: Request, token: Optional[str]=None):
 
     if low == "/pulse":
         await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
-
     if low == "/alpha":
         await send_tg("🧠 <b>Alpha</b>\n" + await build_commentary_8h(), chat_id); return {"ok": True}
-
     if low == "/eth":
         await send_tg(await asset_card("ETHUSDT"), chat_id); return {"ok": True}
-
     if low == "/btc":
         await send_tg(await asset_card("BTCUSDT"), chat_id); return {"ok": True}
 
@@ -792,6 +784,14 @@ async def telegram_webhook(request: Request, token: Optional[str]=None):
             await c.execute("INSERT INTO strategy_versions(name,version,note) VALUES($1,$2,$3)", name, version, note)
         await send_tg(f"📌 Estratégia salva: {name} v{version}", chat_id); return {"ok": True}
 
-    # fallback
     await send_tg("Comando não reconhecido. Use /pulse, /alpha, /eth, /btc, /note, /strat new, /strat last, /notes.", chat_id)
     return {"ok": True}
+
+@app.post("/webhook")
+async def webhook_root(request: Request):
+    return await _process_update(request)
+
+@app.post("/webhook/{rest:path}")
+async def webhook_any(request: Request, rest: str):
+    # aceita /webhook/<token> e variações com %3A etc.
+    return await _process_update(request)
