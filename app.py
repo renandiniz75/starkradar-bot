@@ -1,21 +1,19 @@
-# app.py — Stark DeFi Agent v6.0.3 (auto-webhook)
-# Mudanças-chave:
-# - Auto-registro do Telegram webhook no startup (sem precisar curl)
-# - Fallbacks de preço robustos (Bybit -> Coinbase -> CoinGecko) c/ backoff
-# - Removido Binance e qualquer spam de ordens (whales desativado por padrão)
-# - Pulse/Alpha com bloco de comentários estruturado (8h) e diagramação melhor
-# - Endpoint /admin/refresh_webhook para forçar re-registro
-# - Logs claros; jobs e contadores em /status
-# - Mantém tabelas, endpoints e rotinas das versões anteriores
+# app.py — Stark DeFi Agent v6.0.4
+# Novidades:
+# - Coleta leve de notícias (RSS públicos) + cache em DB + síntese no Pulse/Alpha
+# - Zonas: day high/low, níveis redondos próximos, ETH hedge gatilhos
+# - Comentário expandido: impulso (var 8h), amplitude, funding/OI, “reversões perto de resistência”
+# - Sem Binance; whales OFF por padrão; auto-webhook mantém
+# - Mantém endpoints, tabelas, e rotinas das versões anteriores
 
-import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, json, random
+import os, hmac, hashlib, time, math, csv, io, asyncio, traceback, random
 import datetime as dt
 from zoneinfo import ZoneInfo
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 
 import httpx
 import asyncpg
-from fastapi import FastAPI, Request, HTTPException, Depends
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 # --------- Config ---------
@@ -41,7 +39,7 @@ ETH_HEDGE_2 = float(os.getenv("ETH_HEDGE_2", "3800"))
 ETH_CLOSE   = float(os.getenv("ETH_CLOSE_HEDGE", "3950"))
 
 WHALE_USD_MIN = float(os.getenv("WHALE_USD_MIN", "500000"))
-ENABLE_WHALES = os.getenv("ENABLE_WHALES", "0") == "1"  # desativado por padrão
+ENABLE_WHALES = os.getenv("ENABLE_WHALES", "0") == "1"  # OFF por padrão
 
 # --------- Constantes de APIs ---------
 BYBIT_BASE = "https://api.bybit.com"
@@ -50,7 +48,6 @@ BYBIT_PERP = BYBIT_BASE + "/v5/market/tickers?category=linear&symbol={sym}"
 BYBIT_FUND = BYBIT_BASE + "/v5/market/funding/history?category=linear&symbol=ETHUSDT&limit=1"
 BYBIT_OI   = BYBIT_BASE + "/v5/market/open-interest?category=linear&symbol=ETHUSDT&interval=5min"
 BYBIT_POS  = BYBIT_BASE + "/v5/position/list"
-BYBIT_BAL  = BYBIT_BASE + "/v5/account/wallet-balance"
 
 CB_ETH = "https://api.exchange.coinbase.com/products/ETH-USD/ticker"
 CB_BTC = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
@@ -63,6 +60,12 @@ TG_GET_INFO = TG_API + "/getWebhookInfo"
 TG_SET_HOOK = TG_API + "/setWebhook"
 
 ETHERSCAN_TX = "https://api.etherscan.io/api?module=account&action=txlist&address={addr}&startblock=0&endblock=99999999&sort=desc&apikey={key}"
+
+# RSS fontes públicas (leve)
+RSS_SOURCES = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",   # CoinDesk
+    "https://cointelegraph.com/rss"                      # CoinTelegraph
+]
 
 # --------- App e DB ---------
 app = FastAPI(title="stark-defi-agent")
@@ -142,12 +145,18 @@ CREATE TABLE IF NOT EXISTS news_snap(
 );
 """
 
-# --------- Utils HTTP ---------
+# --------- Utils HTTP / Telegram ---------
 async def fetch_json(url: str, headers: Dict[str,str]|None=None, params: Dict[str,Any]|None=None, timeout: float=15.0):
     async with httpx.AsyncClient(timeout=timeout) as s:
         r = await s.get(url, headers=headers, params=params)
         r.raise_for_status()
         return r.json()
+
+async def fetch_text(url: str, timeout: float=12.0):
+    async with httpx.AsyncClient(timeout=timeout) as s:
+        r = await s.get(url)
+        r.raise_for_status()
+        return r.text
 
 async def fetch_json_retry(url: str, headers=None, params=None, attempts: int=3, base_timeout: float=8.0, jitter: float=0.25):
     last_exc = None
@@ -179,9 +188,9 @@ def action_line(eth_price: float) -> str:
         return f"⚠️ ETH < {ETH_HEDGE_1:.0f} → ativar hedge 15% (22 ETH)."
     if eth_price > ETH_CLOSE:
         return f"↩️ ETH > {ETH_CLOSE:.0f} → avaliar fechar hedge."
-    return "✅ Sem gatilho. Suportes: 4.200/4.000 | Resist: 4.300/4.400."
+    return "✅ Sem gatilho. Zonas: 4.200/4.000 | Resist: 4.300/4.400."
 
-# --------- Preços e Derivativos ---------
+# --------- Preços / Derivativos ---------
 async def get_spot_snapshot() -> dict:
     # 1) Bybit spot
     try:
@@ -192,7 +201,7 @@ async def get_spot_snapshot() -> dict:
             "btc": {"price": float(btc["lastPrice"]), "high": float(btc["highPrice"]), "low": float(btc["lowPrice"])},
         }
     except Exception:
-        # 2) Coinbase
+        # 2) Coinbase (ticker não tem high/low)
         try:
             e = await fetch_json(CB_ETH)
             b = await fetch_json(CB_BTC)
@@ -201,7 +210,7 @@ async def get_spot_snapshot() -> dict:
                 "btc": {"price": float(b["price"]), "high": math.nan, "low": math.nan},
             }
         except Exception:
-            # 3) CoinGecko (pode rate-limit)
+            # 3) CoinGecko (tenta com retry)
             cg = await fetch_json_retry(COINGECKO_SIMPLE, attempts=4, base_timeout=6.0)
             return {
                 "eth": {"price": float(cg["ethereum"]["usd"]), "high": math.nan, "low": math.nan},
@@ -256,14 +265,9 @@ async def ingest_1m():
     finally:
         last_run["ingest_1m"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- Whales (opcional / desativado por padrão) ---------
-_last_trade_time_ms = 0
-_ws_lock = asyncio.Lock()
-
+# --------- Whales OFF ---------
 async def ingest_whales():
-    # Placeholder desativado: evitar qualquer spam.
     last_run["ingest_whales"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
-    return
 
 # --------- Accounts (5m) ---------
 def bybit_sign_qs(secret: str, params: Dict[str, Any]) -> str:
@@ -369,63 +373,177 @@ async def ingest_onchain_eth(addr: str):
     finally:
         last_run["ingest_onchain"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
 
-# --------- Notícias simples (placeholder) ---------
-NEWS_SRC = [
-    # Adapte para seus coletores; aqui só placeholder controlado p/ não spammar.
-]
-async def ingest_news():
-    # neste release, mantemos o contador e a tabela (sem scraping agressivo)
-    # você pode inserir via /admin/news_demo para testar
-    last_run["news"] = dt.datetime.now(TZ).isoformat(timespec="seconds")
-
-# --------- Comentário 6–8h ---------
-def _pct(a,b): 
+# --------- Notícias (RSS leve) ---------
+def _extract_rss_items(xml: str, limit: int = 10) -> List[Tuple[str,str]]:
+    # parsing simples de RSS (sem libs externas) — pega <title> e <link>
+    items = []
     try:
-        return 0.0 if a==0 or a is None or b is None else (b-a)/a*100.0
+        # abordagem leve: split por "<item>"
+        parts = xml.split("<item")
+        for p in parts[1:]:
+            # título
+            t1 = p.find("<title>")
+            t2 = p.find("</title>")
+            l1 = p.find("<link>")
+            l2 = p.find("</link>")
+            if t1!=-1 and t2!=-1:
+                title = p[t1+7:t2].strip()
+            else:
+                title = ""
+            if l1!=-1 and l2!=-1:
+                link = p[l1+6:l2].strip()
+            else:
+                # fallback: guid
+                g1 = p.find("<guid>")
+                g2 = p.find("</guid>")
+                link = p[g1+6:g2].strip() if g1!=-1 and g2!=-1 else ""
+            if title:
+                items.append((title, link))
+            if len(items)>=limit:
+                break
+    except Exception:
+        traceback.print_exc()
+    return items
+
+async def ingest_news():
+    total=0
+    for src in RSS_SOURCES:
+        try:
+            xml = await fetch_text(src, timeout=10.0)
+            items = _extract_rss_items(xml, limit=8)
+            if not items: 
+                continue
+            async with pool.acquire() as c:
+                for title, url in items:
+                    await c.execute("""
+                        INSERT INTO news_snap(source,title,url)
+                        VALUES ($1,$2,$3)
+                        ON CONFLICT DO NOTHING
+                    """, src, title[:512], (url or "")[:512])
+                    total += 1
+        except Exception:
+            # silencioso — fonte pode falhar
+            pass
+    last_run["news"] = f"{dt.datetime.now(TZ).isoformat(timespec='seconds')} (+{total})"
+
+# --------- Níveis / Zonas ---------
+def _pct(a,b):
+    try:
+        return 0.0 if a in (0,None) or b in (0,None) else (b-a)/a*100.0
     except Exception:
         return 0.0
 
+async def compute_levels(symbol: str, hours: int = 24) -> Dict[str, Any]:
+    end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=hours)
+    async with pool.acquire() as c:
+        rows = await c.fetch(
+            "SELECT high,low,close FROM candles_minute WHERE symbol=$1 AND ts BETWEEN $2 AND $3 ORDER BY ts",
+            symbol, start, end
+        )
+    if not rows:
+        return {"day_high": None, "day_low": None, "near_rounds": [], "recent_mid": None}
+
+    highs = [float(r["high"]) for r in rows if r["high"] is not None]
+    lows  = [float(r["low"]) for r in rows if r["low"] is not None]
+    closes= [float(r["close"]) for r in rows if r["close"] is not None]
+    day_high = max(highs) if highs else None
+    day_low  = min(lows) if lows else None
+    recent   = closes[-1] if closes else None
+    recent_mid = (day_high + day_low)/2 if (day_high is not None and day_low is not None) else None
+
+    # níveis redondos perto do preço (±2.5%)
+    rounds=[]
+    if recent:
+        step = 50 if recent<2000 else 100
+        base = int(recent//step)*step
+        for k in range(-5,6):
+            lvl = base + k*step
+            if lvl>0 and abs(lvl-recent)/recent<=0.025:
+                rounds.append(lvl)
+
+    return {
+        "day_high": day_high, "day_low": day_low,
+        "recent_mid": recent_mid,
+        "near_rounds": sorted(set(rounds)),
+        "recent": recent
+    }
+
+# --------- Comentário/Contexto ---------
 async def build_commentary(hours: int=8) -> str:
     end = dt.datetime.now(dt.UTC); start = end - dt.timedelta(hours=hours)
     async with pool.acquire() as c:
         rows = await c.fetch("SELECT ts, eth_usd, btc_usd, eth_btc_ratio FROM market_rel WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
         deriv = await c.fetch("SELECT ts, funding, open_interest FROM derivatives_snap WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
-        whales = await c.fetch("SELECT ts, side, usd_value FROM whale_events WHERE ts BETWEEN $1 AND $2 ORDER BY ts", start, end)
+        nrows = await c.fetch("SELECT ts, source, title FROM news_snap WHERE ts >= now() - interval '12 hours' ORDER BY ts DESC LIMIT 8")
     if not rows:
-        return "⏳ Aguardando histórico para comentário (volte em alguns minutos)."
+        return "⏳ Aguardando histórico para comentário."
 
     eth = [float(r["eth_usd"]) for r in rows if r["eth_usd"] is not None]
     btc = [float(r["btc_usd"]) for r in rows if r["btc_usd"] is not None]
     ratio = [float(r["eth_btc_ratio"]) for r in rows if r["eth_btc_ratio"] is not None]
+
     eth_chg = _pct(eth[0], eth[-1]) if eth else 0.0
     btc_chg = _pct(btc[0], btc[-1]) if btc else 0.0
     ratio_chg = _pct(ratio[0], ratio[-1]) if ratio else 0.0
+    amplitude = (max(eth)-min(eth))/eth[-1]*100.0 if eth else 0.0  # amplitude % nas últimas 8h
 
     funding = float(deriv[-1]["funding"]) if deriv and deriv[-1]["funding"] is not None else None
     oi = float(deriv[-1]["open_interest"]) if deriv and deriv[-1]["open_interest"] is not None else None
 
-    buy = sum(float(w["usd_value"] or 0) for w in whales if (w["side"] or "").upper()=="BUY")
-    sell= sum(float(w["usd_value"] or 0) for w in whales if (w["side"] or "").upper()=="SELL")
-    flow = "neutra"
-    if buy>sell*1.3: flow="compradora"
-    elif sell>buy*1.3: flow="vendedora"
+    # “contexto de notícias” simples: lista 3 títulos distintos
+    headlines = []
+    if nrows:
+        seen=set()
+        for r in nrows:
+            t = (r["title"] or "").strip()
+            if t and t[:80] not in seen:
+                headlines.append("• " + t[:140])
+                seen.add(t[:80])
+            if len(headlines)>=3: break
 
-    # Diagramação pedida
+    # leitura de fluxo/risco
+    flow = "neutra"
+    if eth_chg > 0.6 and (funding is None or funding <= 0.001): flow="compradora"
+    if eth_chg < -0.6 and (funding is None or funding >= 0.0):  flow="vendedora"
+
     lines = []
-    lines.append("🧭 Comentário (últimas 8h)")
-    lines.append(f"• ETH: {eth_chg:+.2f}% " + (f"| funding {funding*100:.3f}%/8h " if funding is not None else "") + (f"| OI ~ {oi:,.0f}" if oi is not None else ""))
-    lines.append(f"• BTC: {btc_chg:+.2f}% | dinâmica {'mais forte' if btc_chg>0 else 'mais fraca' if btc_chg<0 else 'estável'}")
+    lines.append("🧭 Comentário (8h)")
+    lines.append(f"• ETH: {eth_chg:+.2f}% | amplitude {amplitude:.2f}% " + (f"| funding {funding*100:.3f}%/8h " if funding is not None else "") + (f"| OI ~ {oi:,.0f}" if oi is not None else ""))
+    lines.append(f"• BTC: {btc_chg:+.2f}% | {'mais forte' if btc_chg>0 else 'mais fraca' if btc_chg<0 else 'estável'}")
     lines.append(f"• ETH/BTC: {ratio_chg:+.2f}% | {'ETH ganhando beta' if ratio_chg>0 else 'BTC dominante' if ratio_chg<0 else 'equilíbrio'}")
-    lines.append(f"• Fluxo: {flow}. " + ("(🐋 on-chain monitorado)" if ETHERSCAN_API_KEY else "(🐋 on-chain off)"))
-    # Síntese
+    lines.append(f"• Fluxo: {flow}.")
+    if headlines:
+        lines.append("📰 Contexto:")
+        lines += headlines
+
+    # síntese
     if ratio_chg>0 and (funding is None or funding<0.0005):
         lines.append("🧩 Síntese: Pró-ETH (força relativa + funding contido).")
     elif ratio_chg<0 and (funding is not None and funding>0.001):
-        lines.append("🧩 Síntese: Atenção à euforia em derivativos (funding elevado).")
+        lines.append("🧩 Síntese: Euforia em derivativos — risco de reversões rápidas.")
     else:
-        lines.append("🧩 Síntese: Equilíbrio tático; usar gatilhos 3.9k/3.8k/3.95k.")
+        lines.append("🧩 Síntese: Equilíbrio tático; usar zonas como guia.")
 
     return "\n".join(lines)
+
+async def build_zones_block() -> str:
+    lv = await compute_levels("ETHUSDT", 24)
+    if not lv or lv["recent"] is None:
+        return "Zonas: coletando…"
+    z = []
+    if lv["day_high"] is not None and lv["day_low"] is not None:
+        z.append(f"Dia H/L: {lv['day_high']:.0f} / {lv['day_low']:.0f}")
+    if lv["near_rounds"]:
+        z.append("Redondos: " + ", ".join(f"{int(x)}" for x in lv["near_rounds"]))
+    # gatilhos/hedge
+    z.append(f"Gatilhos: <{ETH_HEDGE_2:.0f} (20% hedge), <{ETH_HEDGE_1:.0f} (15%), >{ETH_CLOSE:.0f} (fechar).")
+    # dica de reversão: se preço atual perto de day_high (<=0.3%) e amplitude alta → “atenção à reversão”
+    p = lv["recent"]; dh = lv["day_high"]; dl = lv["day_low"]
+    if p and dh and abs(p-dh)/p <= 0.003:
+        z.append("⚠️ Próximo da resistência do dia — atenção a reversões.")
+    if p and dl and abs(p-dl)/p <= 0.003:
+        z.append("⚠️ Próximo do suporte do dia — risco/retomada.")
+    return "🗺️ Zonas\n" + "\n".join("• "+s for s in z)
 
 async def latest_pulse_text() -> str:
     async with pool.acquire() as c:
@@ -435,10 +553,13 @@ async def latest_pulse_text() -> str:
         d = await c.fetchrow("SELECT * FROM derivatives_snap WHERE symbol='ETHUSDT' AND exchange='bybit' ORDER BY ts DESC LIMIT 1")
     if not (m and e and b):
         return "⏳ Aguardando primeiros dados…"
+
     now = dt.datetime.now(TZ).strftime("%Y-%m-%d %H:%M")
     eth = float(m["eth_usd"]); btc = float(m["btc_usd"]); ratio = float(m["eth_btc_ratio"])
     eh, el, bh, bl = e["high"], e["low"], b["high"], b["low"]
+
     header = [
+        "📊 PULSE",
         f"🕒 {now}",
         f"ETH: ${eth:,.2f}" + (f" (H:{eh:,.2f}/L:{el:,.2f})" if isinstance(eh,(int,float)) and isinstance(el,(int,float)) else ""),
         f"BTC: ${btc:,.2f}" + (f" (H:{bh:,.2f}/L:{bl:,.2f})" if isinstance(bh,(int,float)) and isinstance(bl,(int,float)) else ""),
@@ -447,14 +568,15 @@ async def latest_pulse_text() -> str:
     if d and d["funding"] is not None: header.append(f"Funding (ETH): {float(d['funding'])*100:.3f}%/8h")
     if d and d["open_interest"] is not None: header.append(f"Open Interest (ETH): {float(d['open_interest']):,.0f}")
     header.append(action_line(eth))
+
+    zones = await build_zones_block()
     comment = await build_commentary(8)
-    return "📊 PULSE\n" + "\n".join(header) + "\n\n" + comment
+    return "\n".join(header) + "\n\n" + zones + "\n\n" + comment
 
 async def latest_alpha_text() -> str:
-    # usa o mesmo comentário, mas com prefixo ALPHA + marcador de risco
     text = await latest_pulse_text()
-    risk = "🎯 Risco: funding moderado; atenção a reversões rápidas perto de resistências."
-    return text.replace("📊 PULSE", "🧠 ALPHA") + "\n" + risk
+    # carimbo tático curto
+    return text.replace("📊 PULSE", "🧠 ALPHA") + "\n🎯 Tático: usar zonas e gatilhos; evitar entradas no topo/vale do dia."
 
 async def send_pulse_to_chat():
     await send_tg(await latest_pulse_text())
@@ -475,8 +597,6 @@ async def ensure_webhook():
                 return
         except Exception:
             pass
-
-    # tenta registrar com backoff
     ok = False; err = None
     for i in range(6):
         try:
@@ -495,7 +615,7 @@ def require_admin(secret: str):
     if not ADMIN_SECRET or secret != ADMIN_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
 
-# --------- FastAPI lifecycle ---------
+# --------- Lifecycle ---------
 @app.on_event("startup")
 async def _startup():
     if not DB_URL:
@@ -512,14 +632,14 @@ async def _startup():
     scheduler.add_job(ingest_accounts, "interval", minutes=5, id="ingest_accounts", replace_existing=True)
     if AAVE_ADDR and ETHERSCAN_API_KEY:
         scheduler.add_job(ingest_onchain_eth, "interval", minutes=5, args=[AAVE_ADDR], id="ingest_onchain", replace_existing=True)
+    scheduler.add_job(ingest_news, "interval", minutes=15, id="news", replace_existing=True)
+
+    # Boletins programados
     scheduler.add_job(send_pulse_to_chat, "cron", hour=8,  minute=0, id="bulletin_08", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=14, minute=0, id="bulletin_14", replace_existing=True)
     scheduler.add_job(send_pulse_to_chat, "cron", hour=20, minute=0, id="bulletin_20", replace_existing=True)
-    scheduler.add_job(ingest_news, "interval", minutes=10, id="news", replace_existing=True)
 
     scheduler.start()
-
-    # Auto-webhook
     await ensure_webhook()
 
 @app.on_event("shutdown")
@@ -528,13 +648,13 @@ async def _shutdown():
         await pool.close()
 
 # --------- Endpoints ---------
-@app.get("/healthz")
-async def healthz():
-    return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
-
 @app.get("/")
 async def root():
     return {"name": "stark-defi-agent", "tz": str(TZ)}
+
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "time": dt.datetime.now(TZ).isoformat()}
 
 @app.get("/status")
 async def status():
@@ -554,6 +674,10 @@ async def status():
         },
         "last_run": last_run
     }
+
+@app.get("/levels")
+async def levels():
+    return await compute_levels("ETHUSDT", 24)
 
 @app.get("/pulse")
 async def pulse():
@@ -596,12 +720,19 @@ async def telegram_webhook(request: Request):
     low = text.lower()
 
     if low in ("/start","start"):
-        await send_tg("✅ Bot online. Comandos: /pulse, /alpha, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id)
+        await send_tg("✅ Bot online. Comandos: /pulse, /alpha, /levels, /note <texto>, /strat new <nome> | <versão> | <nota>, /strat last, /notes", chat_id)
         return {"ok": True}
     if low == "/pulse":
         await send_tg(await latest_pulse_text(), chat_id); return {"ok": True}
     if low == "/alpha":
         await send_tg(await latest_alpha_text(), chat_id); return {"ok": True}
+    if low == "/levels":
+        lv = await compute_levels("ETHUSDT", 24)
+        txt = ["🗺️ Zonas (24h)"]
+        if lv.get("day_high") and lv.get("day_low"): txt.append(f"Dia H/L: {lv['day_high']:.0f} / {lv['day_low']:.0f}")
+        if lv.get("near_rounds"): txt.append("Redondos: " + ", ".join(f"{int(x)}" for x in lv["near_rounds"]))
+        txt.append(f"Gatilhos: <{ETH_HEDGE_2:.0f}, <{ETH_HEDGE_1:.0f}, >{ETH_CLOSE:.0f}")
+        await send_tg("\n".join(txt), chat_id); return {"ok": True}
     if low == "/notes":
         async with pool.acquire() as c:
             rows = await c.fetch("SELECT created_at,text FROM notes ORDER BY id DESC LIMIT 5")
@@ -629,7 +760,7 @@ async def telegram_webhook(request: Request):
             await c.execute("INSERT INTO strategy_versions(name,version,note) VALUES($1,$2,$3)", name, version, note)
         await send_tg(f"📎 Estratégia salva: {name} v{version}", chat_id); return {"ok": True}
 
-    await send_tg("Comando não reconhecido. Use /pulse, /alpha, /note, /strat new, /strat last, /notes.", chat_id)
+    await send_tg("Comando não reconhecido. Use /pulse, /alpha, /levels, /note, /strat new, /strat last, /notes.", chat_id)
     return {"ok": True}
 
 @app.get("/export/notes.csv")
@@ -653,13 +784,15 @@ async def export_strats():
 # --------- Admin ---------
 @app.post("/admin/refresh_webhook")
 async def admin_refresh_webhook(secret: str):
-    require_admin(secret)
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
     await ensure_webhook()
     return {"ok": True, "webhook": last_run["webhook"]}
 
 @app.post("/admin/news_demo")
 async def admin_news_demo(secret: str):
-    require_admin(secret)
+    if not ADMIN_SECRET or secret != ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
     async with pool.acquire() as c:
         await c.execute(
             "INSERT INTO news_snap(source,title,url) VALUES($1,$2,$3)",
