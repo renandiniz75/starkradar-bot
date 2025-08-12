@@ -1,94 +1,85 @@
 from __future__ import annotations
-import os, base64, datetime as dt
-from typing import Any, Dict, Optional, List
-import httpx
+import os, io, base64, asyncio
+from datetime import datetime, timezone
 from loguru import logger
-from . import config, data as data_svc, analysis, charts, db, news as news_svc
+import httpx
+from utils import fmt_price, utcnow_iso, spark_png
+from .markets import get_levels, get_funding_oi
+from .news import fetch_feed_items, summarize_items
 
-TELEGRAM_API = "https://api.telegram.org"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-async def tg_send_text(chat_id: int, text: str, parse_mode: str = "HTML"):
-    if not config.BOT_TOKEN: 
-        raise RuntimeError("BOT_TOKEN missing")
-    async with httpx.AsyncClient(timeout=15) as client:
-        url = f"{TELEGRAM_API}/bot{config.BOT_TOKEN}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text, "parse_mode": parse_mode, "disable_web_page_preview": True}
-        r = await client.post(url, json=payload)
-        r.raise_for_status()
-
-async def tg_send_photo(chat_id: int, png_bytes: bytes, caption: Optional[str] = None):
-    if not config.BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN missing")
-    async with httpx.AsyncClient(timeout=20) as client:
-        url = f"{TELEGRAM_API}/bot{config.BOT_TOKEN}/sendPhoto"
-        files = {"photo": ("spark.png", png_bytes, "image/png")}
-        data = {"chat_id": str(chat_id)}
-        if caption: data["caption"] = caption
-        r = await client.post(url, data=data, files=files)
-        r.raise_for_status()
-
-async def set_webhook(host_url: str) -> Dict[str, Any]:
-    if not config.BOT_TOKEN:
-        return {"ok": False, "error": "BOT_TOKEN missing"}
-    async with httpx.AsyncClient(timeout=15) as client:
-        url = f"{TELEGRAM_API}/bot{config.BOT_TOKEN}/setWebhook"
-        target = f"{host_url.rstrip('/')}/webhook"
-        r = await client.post(url, json={"url": target, "drop_pending_updates": True})
-        return r.json()
-
-def _format_sources(rows: List[Any]) -> str:
-    out = []
-    for r in rows:
-        ts = r["ts"].strftime("%H:%M") if r["ts"] else "--:--"
-        title = (r["title"] or "")[:120]
-        host = (r["source"] or "").replace("www.","")
-        url = r["url"] or ""
-        out.append(f"• {ts} {host} — {title}")
-    return "\n".join(out) if out else "—"
-
-async def build_pulse_text() -> str:
-    prices = await data_svc.prices_snapshot()
-    lvls = await analysis.dynamic_levels_48h()
-    fr_oi = await data_svc.funding_and_oi_snapshot()
-    summary = analysis.synth_summary(prices, lvls, fr_oi)
-    rows = await db.get_recent_news(hours=12, limit=6) if config.DATABASE_URL else []
-    sources = _format_sources(rows)
-    now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    return (
-        f"🧭 <b>Pulse</b> — {now}\n"
-        f"{summary}\n\n"
-        f"<b>FONTES (12h)</b>:\n{sources}"
-    )
-
-async def build_asset_text(asset: str) -> str:
-    prices = await data_svc.prices_snapshot()
-    lvls = await analysis.dynamic_levels_48h()
-    t = prices.get(f"{asset}USDT") or {}
-    px = t.get("last")
-    lv = lvls.get(asset, {})
-    s = ", ".join([f"{x:,.0f}" for x in lv.get("S", [])]) or "-"
-    r = ", ".join([f"{x:,.0f}" for x in lv.get("R", [])]) or "-"
-    now = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    return f"{asset} ${px:,.2f if isinstance(px,(int,float)) else '-'}\nNíveis S:{s} | R:{r}\n{now}"
-
-async def handle_start(chat_id: int):
-    # Try a tiny sparkline using ETH 24h candles (fallback empty)
-    prices = await data_svc.prices_snapshot()
-    series = []
-    # Use last/high/low to craft a fake short series if ohlcv not available quickly
-    e = prices.get("ETHUSDT") or {}
-    base = e.get("last") or 0.0
-    series = [max(0.0, base*(0.995 + i*0.0005)) for i in range(40)]
-    img = charts.make_sparkline_png(series)
-    await tg_send_photo(chat_id, img, caption="Bem-vindo! Use /pulse, /eth, /btc, /panel.")
-
-async def handle_pulse(chat_id: int):
-    text = await build_pulse_text()
-    await tg_send_text(chat_id, text)
+async def build_asset_text(asset: str):
+    info = await get_levels(asset)
+    px = info.get("price")
+    s = ", ".join(fmt_price(v) for v in info.get("supports", [])) or "-"
+    r = ", ".join(fmt_price(v) for v in info.get("resists", [])) or "-"
+    now = utcnow_iso()
+    return f"{asset} {fmt_price(px)}\nNíveis S:{s} | R:{r}\n{now}"
 
 async def handle_asset(chat_id: int, asset: str):
-    text = await build_asset_text(asset)
-    await tg_send_text(chat_id, text)
+    txt = await build_asset_text(asset)
+    await send_message(chat_id, txt)
+
+async def handle_pulse(chat_id: int):
+    # ETH
+    eth = await get_levels("ETH")
+    btc = await get_levels("BTC")
+    eth_fr_oi = await get_funding_oi("ETH/USDT")
+    btc_fr_oi = await get_funding_oi("BTC/USDT")
+    items = await fetch_feed_items()
+    news_txt = summarize_items(items)
+
+    def k(pi): return fmt_price(pi.get("price"))
+    def lv(x): 
+        return f"S:{', '.join(fmt_price(v) for v in x.get('supports',[])) or '-'} | R:{', '.join(fmt_price(v) for v in x.get('resists',[])) or '-'}"
+
+    txt = (
+        f"⚾ Pulse — {utcnow_iso()}\n"
+        f"ETH {k(eth)} — funding {eth_fr_oi['funding'] or '-'} | OI {eth_fr_oi['open_interest'] or '-'}\n"
+        f"BTC {k(btc)} — funding {btc_fr_oi['funding'] or '-'} | OI {btc_fr_oi['open_interest'] or '-'}\n"
+        f"NÍVEIS ETH {lv(eth)}\n"
+        f"NÍVEIS BTC {lv(btc)}\n\n"
+        f"FONTES (12h):\n{news_txt}"
+    )
+    await send_message(chat_id, txt)
 
 async def handle_panel(chat_id: int):
-    await handle_pulse(chat_id)
+    # Monta um PNG simples com as séries 24h
+    from .markets import get_price_24h_series
+    eth = await get_price_24h_series("ETH/USDT")
+    btc = await get_price_24h_series("BTC/USDT")
+    import matplotlib.pyplot as plt
+    import io
+    fig, ax = plt.subplots(figsize=(6,3), dpi=120)
+    ax.plot(eth.get("series_24h", []), label="ETH 24h")
+    ax.plot(btc.get("series_24h", []), label="BTC 24h")
+    ax.legend(loc="upper left")
+    ax.set_title("Painel 24h")
+    ax.grid(True, alpha=.2)
+    buf = io.BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png")
+    plt.close(fig); buf.seek(0)
+    await send_photo(chat_id, buf.getvalue())
+
+# --- Telegram helpers -------------------------------------------------
+
+async def send_message(chat_id: int, text: str):
+    if not BOT_TOKEN: 
+        logger.error("BOT_TOKEN ausente")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+
+async def send_photo(chat_id: int, png_bytes: bytes, caption: str|None=None):
+    if not BOT_TOKEN: 
+        logger.error("BOT_TOKEN ausente")
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto"
+    files = {"photo": ("panel.png", png_bytes, "image/png")}
+    data = {"chat_id": chat_id}
+    if caption: data["caption"] = caption
+    async with httpx.AsyncClient(timeout=20) as client:
+        await client.post(url, data=data, files=files)
