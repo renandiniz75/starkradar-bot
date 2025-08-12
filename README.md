@@ -1,29 +1,25 @@
+# Stark DeFi Agent v6.0.15-full
 
-# StarkRadar Bot — 6.0.13-hotfix1
+Bot Telegram com webhook (FastAPI) + análise tática de BTC/ETH, gráficos sparkline,
+níveis dinâmicos robustos, ingest de notícias leve e voz (áudio → texto via OpenAI)
+e comando `/ask` para perguntas livres.
 
-## Variáveis obrigatórias
-- BOT_TOKEN: Token do Telegram Bot
-- HOST_URL: URL pública do serviço (https://...)
+## Comandos
+- `/start` — boas‑vindas + painéis rápidos.
+- `/pulse` — visão tática (preços, ETH/BTC, variações 8h/12h, S/R, ações).
+- `/eth`, `/btc` — foco no ativo.
+- `/panel` — painel compacto + gráfico sparkline.
+- **Voz:** envie áudio; o bot transcreve e responde.
+- `/ask <pergunta>` — pergunta livre com resposta sintetizada.
 
-## Variáveis opcionais
-- DATABASE_URL: Postgres (para cache de notícias)
-- WEBHOOK_AUTO=1: define webhook no startup
-- SPARKLINES=1: liga sparkline PNG no /start (requer matplotlib)
-- PROVIDERS: bybit,okx,binance (default)
-- NEWS_SOURCES: CSV com feeds RSS
+## Deploy rápido (Render)
+1. Web Service → Upload do ZIP deste repo.
+2. Start command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+3. Defina variáveis de ambiente do `.env.example`.
+4. (Opcional) `WEBHOOK_AUTO=1` para setar automaticamente no startup.
+5. Teste `/status` e `/admin/setwebhook`.
 
-## Deploy Render
-1) Novo Web Service
-2) Build Command: `pip install -r requirements.txt`
-3) Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-4) Set envs e Deploy.
-
-## Endpoints úteis
-- GET /status
-- GET /admin/ping/telegram
-- GET /admin/webhook/set
-- POST /admin/db/migrate
-- POST /webhook  (Telegram)
-
-## Comandos do Bot
-/start, /pulse, /btc, /eth, /help
+## Observações
+- Fechamento garantido de clientes CCXT (`await ex.close()`).
+- Migrations idempotentes para `news_items`.
+- Fallbacks seguros quando dados externos falharem (sem NaN).
