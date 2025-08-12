@@ -1,9 +1,10 @@
 fastapi==0.115.0
-uvicorn==0.30.1
+uvicorn[standard]==0.30.1
 asyncpg==0.29.0
 python-telegram-bot==20.7
-ccxt==4.2.84
+# httpx precisa ser compatível com PTB 20.7
 httpx==0.25.2
+ccxt==4.2.84
 aiohttp==3.9.5
 pydantic==2.11.7
 python-dotenv==1.0.1
@@ -12,3 +13,4 @@ matplotlib==3.9.2
 pandas==2.2.2
 beautifulsoup4==4.12.3
 lxml==5.2.1
+openai==1.42.0

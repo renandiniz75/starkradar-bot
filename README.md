@@ -1,40 +1,27 @@
-# Stark DeFi Agent v6.0.16-full
+# Stark Cripto Radar — v0.16-full
 
-**Objetivo:** Bot Telegram com FastAPI, análise tática de BTC/ETH, níveis dinâmicos, notícias e autotestes.  
-**Comandos:** `/start`, `/pulse`, `/eth`, `/btc`, `/panel`, `/selftest` (privado).
+Bot de Telegram com webhook em FastAPI + gráficos, análise e transcrição de áudio.
+
+## Comandos
+
+- `/start` — boas-vindas + instruções
+- `/pulse` — boletim com preços, variação, níveis e síntese de notícias (12h)
+- `/eth` — leitura rápida do ETH
+- `/btc` — leitura rápida do BTC
+- `/panel` — mini painel PNG (ETH, BTC e ETH/BTC)
+
+Suporte a **áudio**: envie uma mensagem de voz com a pergunta. Se `OPENAI_API_KEY` estiver configurada, o bot transcreve com Whisper e responde via GPT com foco em cripto.
 
 ## Variáveis de ambiente
-- `BOT_TOKEN` (obrigatório) — token do bot do Telegram
-- `HOST_URL` (obrigatório p/ webhook) — ex: `https://seuservico.onrender.com`
-- `DATABASE_URL` (opcional) — Postgres: `postgres://user:pass@host:5432/db`
-- `OPENAI_API_KEY` (opcional) — para STT/TTS no futuro (placeholder)
-- `WEBHOOK_AUTO=1` (opcional) — auto-configura webhook no startup
-- `NEWS_SOURCES` (opcional) — lista separada por vírgula (RSS/HTML), ex: `https://www.coindesk.com/arc/outboundfeeds/rss/`
-- `TZ` (opcional) — timezone, ex: `UTC`
 
-## Deploy rápido
-1. Suba o repositório (estes arquivos) no GitHub.
-2. Render: Python 3.11, build padrão. Porta `$PORT`.
-3. **requirements.txt** inclui `uvicorn`.
-4. Configure as envs acima; salve.
-5. Abra `/status` — se OK, rode `/selftest` no bot ou `GET /selftest` (com `X-Admin-Secret`, ver abaixo).
-6. Mande `/start` no Telegram. Depois `/pulse`, `/eth`, `/btc`.
+```
+BOT_TOKEN= # token do @BotFather
+WEBHOOK_URL= # https://seuapp.onrender.com/webhook
+OPENAI_API_KEY= # opcional (voz e /gpt)
+NEWS_FEEDS=https://www.theblock.co/rss;https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml
+```
 
-## Rotas HTTP
-- `GET /` — ping
-- `GET /status` — estado, versão, contagem de linhas e último erro
-- `POST /webhook` — webhook Telegram
-- `POST /admin/webhook/set` — define webhook (env `HOST_URL` + `BOT_TOKEN`)
-- `GET /selftest` — autoteste (precisa `X-Admin-Secret` = `ADMIN_SECRET` env)
+## Deploy (Render)
 
-## Banco de dados
-Migrações pequenas são executadas automaticamente (tabela `_migrations`).  
-Tabela `news_items`: colunas tolerantes a `NULL` (sem NOT NULL rígido) e defaults.
-
-## Notas
-- Fechamento de clientes CCXT é **garantido** (sem *Unclosed session*).
-- Níveis S/R baseados em extremos de 48h, com *guards* para dados ausentes.
-- Sem rodapé nos balões (rodapé só no código e no `/status`).
-
----
-**Versão:** v6.0.16-full
+- `requirements.txt` já inclui `uvicorn`.
+- Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
