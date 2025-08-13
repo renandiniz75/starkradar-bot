@@ -1,29 +1,24 @@
-# StarkRadar Bot 0.17.0-full
+# starkradar v0.18-step2
 
-## Endpoints
-- `/` health
-- `/status` status + linecount
-- `/webhook` Telegram webhook (POST from Telegram)
+## Como usar
+1. Suba estes arquivos no GitHub/Render.
+2. Defina as variáveis de ambiente:
+   - `BOT_TOKEN` (obrigatório)
+   - `WEBHOOK_SECRET` (opcional, e use o mesmo header na configuração do webhook no Telegram/Render)
+3. Aponte o webhook do Telegram para `POST https://SEU_DOMINIO/webhook`.
 
-## Environment
-```
-BOT_TOKEN=123:ABC
-TELEGRAM_SECRET=optional
-PORT=10000
-```
-Set webhook once:
-```
-curl -sS "https://api.telegram.org/bot$BOT_TOKEN/setWebhook?url=https://YOUR-RENDER-URL/webhook"
-```
+### Comandos
+- `/start` – boas-vindas e menu
+- `/pulse` – visão rápida (ETH, BTC, ETH/BTC)
+- `/eth` – detalhe do Ethereum
+- `/btc` – detalhe do Bitcoin
 
-## Commands
-- `/start` – boas-vindas + sparkline ETH
-- `/pulse` – ETH/BTC resumo e análise curta
-- `/eth` – snapshot com níveis e sparkline
-- `/btc` – snapshot com níveis e sparkline
-- `/panel` – ETH e BTC em sequência
+### Observações
+- Usa CoinGecko (sem API key) para *spot, 24h high/low e série intraday*.
+- Evita Binance/Bybit para contornar 403/451.
+- Gráficos via Matplotlib (sparkline).
 
-## Notes
-- Versão e contagem de linhas **não** aparecem nos balões. Ver só em `/status`.
-- Preços via Bybit público com fallback CoinGecko. Klíne 24h via Bybit.
-- Sem dependência de `python-telegram-bot` para evitar conflitos; enviamos direto na API do Telegram.
+### Roadmap rápido
+- Funding/Open Interest (Coinglass/Glassnode) – precisa de API keys.
+- Alertas e gatilhos automáticos.
+- Painéis com múltiplos tempos gráficos.
