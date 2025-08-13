@@ -1,23 +1,22 @@
 # services/images.py
-# Geração de PNGs (sparklines) simples
-
+# Sparkline PNG generation
 import io
-from typing import List, Optional
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-def sparkline_png(series: Optional[List[float]], title: str) -> bytes:
-    fig = plt.figure(figsize=(5.5, 2.4), dpi=160)
+def sparkline_png(series, width=640, height=200):
+    fig = plt.figure(figsize=(width/100, height/100), dpi=100)
     ax = fig.add_subplot(111)
-    if series and len(series) >= 2:
-        ax.plot(series, linewidth=2)
-    ax.set_title(title, fontsize=10)
-    ax.grid(alpha=0.25)
-    ax.set_xlabel("")
-    ax.set_ylabel("")
-    buf = io.BytesIO()
-    fig.tight_layout()
-    fig.savefig(buf, format="png", bbox_inches="tight")
+    if series:
+        ax.plot(series)
+        ax.fill_between(range(len(series)), series, alpha=0.1)
+    ax.set_xticks([]); ax.set_yticks([])
+    for spine in ["top","right","left","bottom"]:
+        ax.spines[spine].set_visible(False)
+    bio = io.BytesIO()
+    plt.tight_layout()
+    fig.savefig(bio, format="png")
     plt.close(fig)
-    return buf.getvalue()
+    bio.seek(0)
+    return bio.getvalue()
