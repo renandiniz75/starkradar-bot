@@ -1,2 +1,2 @@
-# services/__init__.py
-# marcador de pacote# package marker
+# torna "services" um pacote Python
+__all__ = ["markets", "tg"]
