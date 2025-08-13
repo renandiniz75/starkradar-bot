@@ -1,67 +1,184 @@
 # services/markets.py
-# Data providers with graceful fallbacks (CoinGecko primary; Coinbase and Binance public as best-effort)
+# Foco: fontes públicas com fallback + retry (Coinbase -> Kraken -> Bitstamp)
+import asyncio, time
+from typing import Dict, Any, List, Optional, Tuple
 from loguru import logger
-import httpx, asyncio, time
+import httpx
+from datetime import datetime, timezone
 
-HEADERS = {"User-Agent": "starkradar-bot/0.18"}
+HTTP_TIMEOUT = 8.0
+RETRIES = 2
+BACKOFF = 0.8
 
-COINGECKO = "https://api.coingecko.com/api/v3"
-COINBASE = "https://api.coinbase.com/v2"
+# --------- Utils HTTP ---------
+async def _get_json(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Any:
+    params = params or {}
+    headers = headers or {"User-Agent": "StarkRadarBot/0.17"}
+    for attempt in range(RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                r = await client.get(url, params=params, headers=headers)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            if attempt < RETRIES:
+                await asyncio.sleep(BACKOFF * (attempt + 1))
+                continue
+            logger.warning("GET fail: %s %s", url, str(e))
+            raise
 
-# Map assets to coingecko ids and symbols for convenience
-ASSETS = {
-    "ETH": {"cg_id": "ethereum", "symbol": "ETHUSDT"},
-    "BTC": {"cg_id": "bitcoin",  "symbol": "BTCUSDT"},
+# --------- Sources ---------
+async def _coinbase_ticker(symbol: str) -> Optional[float]:
+    # symbol: "ETH-USD" | "BTC-USD"
+    url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
+    try:
+        data = await _get_json(url)
+        return float(data.get("price"))
+    except Exception:
+        return None
+
+async def _coinbase_candles(symbol: str, granularity: int = 3600, limit: int = 24) -> List[Tuple[int, float]]:
+    # returns [(ts_sec, close), ...] ascending
+    url = f"https://api.exchange.coinbase.com/products/{symbol}/candles"
+    params = {"granularity": granularity}
+    try:
+        data = await _get_json(url, params=params)
+        # Coinbase returns [[time, low, high, open, close, volume], ...] (time in seconds), DESC order
+        rows = sorted(data, key=lambda x: x[0])
+        if limit:
+            rows = rows[-limit:]
+        series = [(int(r[0]), float(r[4])) for r in rows]
+        return series
+    except Exception:
+        return []
+
+async def _kraken_ticker(pair: str) -> Optional[float]:
+    # pair: "ETHUSD" | "BTCUSD"
+    url = "https://api.kraken.com/0/public/Ticker"
+    params = {"pair": pair}
+    try:
+        data = await _get_json(url, params=params)
+        result = data.get("result") or {}
+        key = next(iter(result.keys()), None)
+        if not key:
+            return None
+        last = result[key]["c"][0]
+        return float(last)
+    except Exception:
+        return None
+
+async def _kraken_ohlc(pair: str, interval: int = 60) -> List[Tuple[int, float]]:
+    # returns ascending [(ts, close)]
+    url = "https://api.kraken.com/0/public/OHLC"
+    params = {"pair": pair, "interval": interval}
+    try:
+        data = await _get_json(url, params=params)
+        result = data.get("result") or {}
+        # ignore "last"
+        keys = [k for k in result.keys() if k != "last"]
+        if not keys:
+            return []
+        arr = result[keys[0]]
+        series = [(int(row[0]), float(row[4])) for row in arr][-24:]
+        return series
+    except Exception:
+        return []
+
+async def _bitstamp_ticker(symbol: str) -> Optional[float]:
+    # symbol: "ethusd" | "btcusd"
+    url = f"https://www.bitstamp.net/api/v2/ticker/{symbol}/"
+    try:
+        data = await _get_json(url)
+        return float(data.get("last"))
+    except Exception:
+        return None
+
+async def _bitstamp_ohlc(symbol: str, step: int = 3600, limit: int = 24) -> List[Tuple[int, float]]:
+    url = f"https://www.bitstamp.net/api/v2/ohlc/{symbol}/"
+    params = {"step": step, "limit": limit}
+    try:
+        data = await _get_json(url, params=params)
+        data = (data or {}).get("data", {}).get("ohlc", [])
+        series = [(int(x["timestamp"]), float(x["close"])) for x in data]
+        return series
+    except Exception:
+        return []
+
+# --------- Public API ---------
+_SYMBOLS = {
+    "ETH": {"cb": "ETH-USD", "kr": "ETHUSD", "bs": "ethusd"},
+    "BTC": {"cb": "BTC-USD", "kr": "BTCUSD", "bs": "btcusd"},
 }
 
-async def _get_json(client: httpx.AsyncClient, url: str, params=None):
-    try:
-        r = await client.get(url, params=params, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        logger.warning("GET fail: {} {}", url, e)
+async def price_now(asset: str) -> Optional[float]:
+    m = _SYMBOLS.get(asset.upper())
+    if not m:
         return None
+    # Coinbase
+    px = await _coinbase_ticker(m["cb"])
+    if px is not None:
+        return px
+    # Kraken
+    px = await _kraken_ticker(m["kr"])
+    if px is not None:
+        return px
+    # Bitstamp
+    px = await _bitstamp_ticker(m["bs"])
+    return px
 
-async def spot_snapshot(asset: str):
-    """Return dict: price, change_24h, high_24h, low_24h, series (list of floats)."""
-    a = ASSETS.get(asset.upper())
-    if not a:
-        return None
-    cg_id = a["cg_id"]
-    async with httpx.AsyncClient() as client:
-        # 1) price + change + hi/lo
-        mkt = await _get_json(client, f"{COINGECKO}/coins/{cg_id}", params={"localization":"false","tickers":"false","market_data":"true","community_data":"false","developer_data":"false","sparkline":"false"})
-        price = change = high = low = None
-        if mkt and mkt.get("market_data"):
-            md = mkt["market_data"]
-            price = md["current_price"].get("usd")
-            change = md["price_change_percentage_24h"]
-            high = md["high_24h"].get("usd")
-            low  = md["low_24h"].get("usd")
+async def series_24h(asset: str) -> List[Tuple[int, float]]:
+    m = _SYMBOLS.get(asset.upper())
+    if not m: return []
+    series = await _coinbase_candles(m["cb"], 3600, 24)
+    if series: return series
+    series = await _kraken_ohlc(m["kr"], 60)
+    if series: return series
+    series = await _bitstamp_ohlc(m["bs"], 3600, 24)
+    return series or []
 
-        # 2) intraday series (last 24h hourly)
-        chart = await _get_json(client, f"{COINGECKO}/coins/{cg_id}/market_chart", params={"vs_currency":"usd","days":"1","interval":"hourly"})
-        series = []
-        if chart and chart.get("prices"):
-            # prices is [[ts, price], ...]
-            series = [float(p[1]) for p in chart["prices"] if isinstance(p, list) and len(p) >= 2]
+def _hi_lo_change(series: List[Tuple[int,float]]) -> Dict[str, Optional[float]]:
+    if not series:
+        return {"high": None, "low": None, "change_24h": None}
+    closes = [p for _, p in series]
+    high = max(closes)
+    low = min(closes)
+    change = None
+    if len(closes) >= 2:
+        change = (closes[-1] / closes[0] - 1) * 100.0
+    return {"high": high, "low": low, "change_24h": change}
 
-        return {"asset": asset, "price": price, "change_24h": change, "high_24h": high, "low_24h": low, "series_24h": series}
+def _levels(closes: List[float]) -> Dict[str, str]:
+    if not closes:
+        return {"S": "- / -", "R": "- / -"}
+    last = closes[-1]
+    # níveis simples: % bands + extremos
+    s1 = min(last * 0.97, min(closes))
+    s2 = min(last * 0.95, sorted(closes)[max(0, int(len(closes)*0.1)-1)])
+    r1 = max(last * 1.03, max(closes))
+    r2 = max(last * 1.05, sorted(closes)[int(len(closes)*0.9)])
+    def fmt(x): 
+        try: return f"{x:,.2f}"
+        except: return "-"
+    return {"S": f"{fmt(s2)} / {fmt(s1)}", "R": f"{fmt(r1)} / {fmt(r2)}"}
 
-async def pair_snapshot():
-    """ETH/BTC pair via CoinGecko (relative performance)."""
-    async with httpx.AsyncClient() as client:
-        data = await _get_json(client, f"{COINGECKO}/simple/price", params={"ids":"ethereum,bitcoin","vs_currencies":"btc,usd","include_24hr_change":"true"})
-        if not data: 
-            return None
-        eth_btc = data.get("ethereum", {}).get("btc")
-        eth_usd = data.get("ethereum", {}).get("usd")
-        btc_usd = data.get("bitcoin",  {}).get("usd")
-        eth_chg = data.get("ethereum", {}).get("usd_24h_change")
-        btc_chg = data.get("bitcoin",  {}).get("usd_24h_change")
-        return {"eth_btc": eth_btc, "eth_usd": eth_usd, "btc_usd": btc_usd, "eth_chg": eth_chg, "btc_chg": btc_chg}
+async def snapshot(asset: str) -> Dict[str, Any]:
+    ser = await series_24h(asset)
+    px = await price_now(asset)
+    hlc = _hi_lo_change(ser)
+    closes = [p for _, p in ser]
+    lv = _levels(closes)
+    return {
+        "asset": asset,
+        "price": px,
+        "high_24h": hlc["high"],
+        "low_24h": hlc["low"],
+        "change_24h_pct": hlc["change_24h"],
+        "series_24h": ser,
+        "levels": lv,
+        "ts": int(time.time())
+    }
 
-async def funding_open_interest_stub():
-    """Placeholder returning None. Can be expanded with Glassnode/Coinglass APIs (need keys)."""
-    return {"funding_rate": None, "open_interest": None}
+async def health_check() -> Dict[str, Any]:
+    ok_eth = await price_now("ETH") is not None
+    ok_btc = await price_now("BTC") is not None
+    return {"eth": ok_eth, "btc": ok_btc}
