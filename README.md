@@ -1,1 +1,3 @@
-# StarkRadar Bot v0.20\n
+# StarkRadar Bot
+
+Bot de exemplo.
