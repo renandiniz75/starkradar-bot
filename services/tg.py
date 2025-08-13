@@ -1,84 +1,103 @@
-# v0.17.2-hotfixB • services/tg.py
+# services/tg.py
+# Lado Telegram: montagem de mensagens e envio
+
 import io
-from typing import Tuple
+import os
+from typing import Dict, Any
 from loguru import logger
 import httpx
+
 from . import markets
+from .analysis import asset_analysis, portfolio_hint
+from .images import sparkline_png
 
-API = "https://api.telegram.org"
+TELEGRAM_BASE = "https://api.telegram.org"
 
-async def _post(token: str, method: str, data: dict, files=None):
-    url = f"{API}/bot{token}/{method}"
-    timeout = httpx.Timeout(10.0)
-    async with httpx.AsyncClient(timeout=timeout) as c:
-        r = await c.post(url, data=data, files=files)
-        r.raise_for_status()
-        return r.json()
+def _fmt(v, n=2, prefix="$"):
+    if v is None:
+        return "-"
+    return f"{prefix}{v:,.{n}f}"
 
-async def send_text(token: str, chat_id: int, text: str, parse_mode: str|None=None):
-    data = {"chat_id": chat_id, "text": text}
-    if parse_mode: data["parse_mode"] = parse_mode
-    try:
-        await _post(token, "sendMessage", data)
-    except Exception as e:
-        logger.warning("send_text fail: {}", e)
+def _fmt_pct(v, n=2):
+    if v is None:
+        return "-"
+    sign = "+" if v >= 0 else ""
+    return f"{sign}{v:.{n}f}%"
 
-async def send_png(token: str, chat_id: int, caption: str, png_bytes: bytes):
-    files = {"photo": ("chart.png", io.BytesIO(png_bytes), "image/png")}
-    data = {"chat_id": chat_id, "caption": caption}
-    try:
-        await _post(token, "sendPhoto", data, files=files)
-    except Exception as e:
-        logger.warning("send_png fail: {}", e)
+async def send_text(bot_token: str, chat_id: int, text: str, disable_web_page_preview: bool=True):
+    url = f"{TELEGRAM_BASE}/bot{bot_token}/sendMessage"
+    async with httpx.AsyncClient(timeout=10.0) as c:
+        await c.post(url, data={
+            "chat_id": chat_id,
+            "text": text,
+            "disable_web_page_preview": "true" if disable_web_page_preview else "false",
+        })
 
-def _fmt_money(v): return "-" if v is None else f"${v:,.2f}"
-def _fmt_pct(v):   return "-" if v is None else f"{v:+.2f}%"
+async def send_photo(bot_token: str, chat_id: int, png: bytes, caption: str):
+    url = f"{TELEGRAM_BASE}/bot{bot_token}/sendPhoto"
+    files = {'photo': ('chart.png', png, 'image/png')}
+    data = {'chat_id': str(chat_id), 'caption': caption}
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        await c.post(url, files=files, data=data)
 
-def _levels_text(lv):
-    s = f"Níveis S:{_fmt_money(lv.get('s1'))}, {_fmt_money(lv.get('s2'))} | R:{_fmt_money(lv.get('r1'))}, {_fmt_money(lv.get('r2'))}"
-    return s
+# -------------------- mensagens -------------------- #
 
-def _quick_view(asset_snap: dict) -> str:
-    p = _fmt_money(asset_snap["price"])
-    c = _fmt_pct(asset_snap["change_24h"])
-    lv = _levels_text(asset_snap["levels"])
-    return f"{asset_snap['asset']} {p} ({c} 24h)\n{lv}"
+WELCOME = (
+    "Bem-vindo! 👋\n"
+    "Use /pulse, /eth, /btc, /panel."
+)
 
-def _pulse_comment(eth: dict, btc: dict) -> str:
-    # heurística simples baseada em distância a R1/S1 e variação
-    lines = []
-    for a in (eth, btc):
-        if a["price"] and a["levels"]["r1"] and a["levels"]["s1"]:
-            px = a["price"]; r1 = a["levels"]["r1"]; s1 = a["levels"]["s1"]
-            dist_r = (r1 - px)/px*100
-            dist_s = (px - s1)/px*100
-            bias = "alta" if (a["change_24h"] or 0) > 0 else "baixa" if (a["change_24h"] or 0) < 0 else "neutra"
-            lines.append(f"{a['asset']}: viés {bias}; ~{abs(dist_r):.2f}% de R1 / ~{abs(dist_s):.2f}% de S1.")
-    if lines:
-        lines.append("Ação: operar rompimentos com confirmação e reduzir risco se perder S1.")
-    return "\n".join(lines) or "Ação: foco nos gatilhos e gestão defensiva em perdas de suporte."
+async def handle_start(bot_token: str, chat_id: int):
+    await send_text(bot_token, chat_id, WELCOME)
 
-# ----------------- handlers -----------------
+async def _asset_block(asset: str) -> Dict[str, Any]:
+    s = await markets.snapshot(asset)
+    head, rec = asset_analysis(s)
+    txt = head + "\n" + rec
+    png = sparkline_png(s.get("series"), f"{asset} 24h")
+    return {"text": txt, "png": png, "snap": s}
 
-async def handle_asset(token: str, chat_id: int, asset: str):
-    snap = await markets.snapshot(asset)
-    title = f"{asset} 24h"
-    png = markets.spark_png(snap["series"], title)
-    caption = _quick_view(snap) + f"\n{snap['ts']}"
-    await send_png(token, chat_id, caption, png)
+async def handle_asset(bot_token: str, chat_id: int, asset: str):
+    block = await _asset_block(asset)
+    txt = block["text"]
+    s = block["snap"]
+    extra = portfolio_hint(asset, s)
+    if extra:
+        txt += "\n" + extra
+    await send_photo(bot_token, chat_id, block["png"], txt)
 
-async def handle_pulse(token: str, chat_id: int):
-    eth, btc = await markets.snapshot("ETH"), await markets.snapshot("BTC")
-    rel = (eth["price"]/btc["price"]) if (eth["price"] and btc["price"]) else None
-    text = (
-        f"Pulse 🕒 {eth['ts']}\n"
-        f"{_quick_view(eth)}\n"
-        f"{_quick_view(btc)}\n"
-        + (f"ETH/BTC {rel:.5f}\n" if rel else "")
-        + _pulse_comment(eth, btc)
-    )
-    await send_text(token, chat_id, text)
+async def handle_pulse(bot_token: str, chat_id: int):
+    eth = await markets.snapshot("ETH")
+    btc = await markets.snapshot("BTC")
 
-async def handle_panel(token: str, chat_id: int):
-    await handle_asset(token, chat_id, "ETH")
-    await handle_asset(token, chat_id, "BTC")
+    eth_line, eth_rec = asset_analysis(eth)
+    btc_line, btc_rec = asset_analysis(btc)
+
+    rel = eth.get("rel_eth_btc")
+    funding = eth.get("funding")
+    oi = eth.get("open_interest_usd")
+
+    header = f"Pulse 🕒 " \
+             f"{'ETH ' + _fmt(eth.get('price')) + ' (' + _fmt_pct(eth.get('chg24')) + ')' if eth.get('price') else 'ETH -'}\n" \
+             f"{'BTC ' + _fmt(btc.get('price')) + ' (' + _fmt_pct(btc.get('chg24')) + ')' if btc.get('price') else 'BTC -'}"
+
+    analysis = []
+    if rel:
+        analysis.append(f"ETH/BTC {rel:.5f}.")
+    if funding is not None:
+        analysis.append(f"Funding (ETH perp) {funding:.4%}.")
+    if oi is not None:
+        analysis.append(f"OI (ETH) {_fmt(oi)}.")
+
+    analysis.append("Foco: gatilhos de rompimento (R1/R2) e defesa em perdas de suportes (S1/S2).")
+
+    text = header + "\n\n" + eth_line + "\n" + btc_line + "\n\n" + " ".join(analysis)
+    await send_text(bot_token, chat_id, text)
+
+async def handle_panel(bot_token: str, chat_id: int):
+    # ETH
+    eth = await _asset_block("ETH")
+    await send_photo(bot_token, chat_id, eth["png"], eth["text"])
+    # BTC
+    btc = await _asset_block("BTC")
+    await send_photo(bot_token, chat_id, btc["png"], btc["text"])
