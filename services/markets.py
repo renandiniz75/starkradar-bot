@@ -1,95 +1,99 @@
 # services/markets.py
-import asyncio, datetime
+# v0.17.3 – Fonte única: Bybit REST v5 (kline/markPrice)
+# Notas:
+# - Evita CCXT para preços intraday (Binance 451).
+# - Headers com User-Agent para não cair em proteção.
+# - Fecha sessões httpx corretamente.
+
+from __future__ import annotations
+import math, statistics, time
+from datetime import datetime, timezone
 import httpx
 from loguru import logger
 
-COINGECKO_SIMPLE = "https://api.coingecko.com/api/v3/simple/price"
-BYBIT_TICKERS = "https://api.bybit.com/v5/market/tickers"
-BYBIT_KLINE = "https://api.bybit.com/v5/market/kline"
+BYBIT_BASE = "https://api.bybit.com"
+UA = "Mozilla/5.0 (X11; Linux x86_64) StarkRadarBot/0.17"
 
-SYMBOLS = {
-    "ETH": {"coingecko":"ethereum","bybit_symbol":"ETHUSDT","category":"spot"},
-    "BTC": {"coingecko":"bitcoin","bybit_symbol":"BTCUSDT","category":"spot"},
+# Mapa de símbolos padronizados -> símbolo Bybit linear perp
+SYMBOL_MAP = {
+    "ETH": "ETHUSDT",
+    "BTC": "BTCUSDT",
 }
 
-def _levels_from_price(p: float) -> dict:
-    if not isinstance(p,(int,float)) or p <= 0:
-        return {"supports": [], "resistances": []}
-    # Dynamic rounder
-    step = 50 if p > 5000 else 25 if p > 1000 else 10
-    supports = [p - 3*step, p - 2*step, p - step]
-    resists = [p + step, p + 2*step, p + 3*step]
-    return {"supports":[round(x/step)*step for x in supports],
-            "resistances":[round(x/step)*step for x in resists]}
+def _now_utc_str() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-async def _bybit_price(asset: str) -> dict|None:
-    meta = SYMBOLS[asset]
-    params = {"category": meta["category"], "symbol": meta["bybit_symbol"]}
-    async with httpx.AsyncClient(timeout=10) as cli:
-        r = await cli.get(BYBIT_TICKERS, params=params)
-        if r.status_code != 200:
-            return None
-        data = r.json().get("result",{}).get("list",[])
-        if not data:
-            return None
-        row = data[0]
-        price = float(row.get("lastPrice") or 0.0)
-        chg = float(row.get("price24hPcnt") or 0.0) * 100.0
-        high = float(row.get("highPrice") or 0.0)
-        low = float(row.get("lowPrice") or 0.0)
-        return {"price": price, "change_24h": chg, "high": high, "low": low}
-
-async def _coingecko_price(asset: str) -> dict|None:
-    meta = SYMBOLS[asset]
-    params = {"ids": meta["coingecko"], "vs_currencies":"usd", "include_24hr_change":"true"}
-    async with httpx.AsyncClient(timeout=10) as cli:
-        r = await cli.get(COINGECKO_SIMPLE, params=params)
-        if r.status_code != 200:
-            return None
-        obj = r.json().get(meta["coingecko"]) or {}
-        price = float(obj.get("usd") or 0.0)
-        chg = float(obj.get("usd_24h_change") or 0.0)
-        return {"price": price, "change_24h": chg}
-
-async def price(asset: str) -> dict:
-    # Try Bybit, fallback to Coingecko
-    for fn in (_bybit_price, _coingecko_price):
-        try:
-            out = await fn(asset)
-            if out and out.get("price",0)>0:
-                return out
-        except Exception as e:
-            logger.warning("price source failed {}: {}", fn.__name__, e)
-    return {"price": None, "change_24h": None}
+async def _get_json(client: httpx.AsyncClient, url: str, params: dict) -> dict | None:
+    try:
+        r = await client.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.warning(f"bybit GET fail: {e}")
+        return None
 
 async def series_24h(asset: str) -> dict:
-    meta = SYMBOLS[asset]
-    params = {"category": meta["category"], "symbol": meta["bybit_symbol"], "interval":"60", "limit":"24"}
-    series = []
-    async with httpx.AsyncClient(timeout=15) as cli:
-        try:
-            r = await cli.get(BYBIT_KLINE, params=params)
-            data = r.json().get("result",{}).get("list",[])
-            # list of [start, open, high, low, close, volume, turnover]
-            for row in data:
-                close = float(row[4])
-                ts = int(row[0])
-                series.append([ts, close])
-        except Exception as e:
-            logger.warning("bybit kline failed: {}", e)
-    return {"series": series}
+    """
+    Retorna:
+      {
+        'asset': 'ETH',
+        'price': 4599.12,
+        'high': 4680.0,
+        'low': 4310.5,
+        'series_24h': [(ts_ms, close), ... 24 pts],
+        'levels': {'S': [..], 'R': [..]},
+        'ts': 'YYYY-MM-DD HH:MM UTC'
+      }
+    """
+    symbol = SYMBOL_MAP.get(asset.upper())
+    if not symbol:
+        return {"asset": asset, "price": None, "high": None, "low": None, "series_24h": [], "levels": {"S":[],"R":[]}, "ts": _now_utc_str()}
 
-async def snapshot(asset: str) -> dict:
-    p = await price(asset)
-    ser = await series_24h(asset)
-    lv = _levels_from_price(p.get("price") or 0)
-    return {"asset": asset, **p, **ser, "levels": lv}
+    headers = {"User-Agent": UA, "Accept": "application/json"}
+    async with httpx.AsyncClient(headers=headers, base_url=BYBIT_BASE) as client:
+        # Kline 1h, últimos 24 candles
+        k = await _get_json(
+            client,
+            "/v5/market/kline",
+            {
+                "category": "linear",
+                "symbol": symbol,
+                "interval": "60",
+                "limit": 24,
+            },
+        )
+        if not k or k.get("retCode") != 0:
+            logger.warning("bybit kline failed: %s", k)
+            return {"asset": asset, "price": None, "high": None, "low": None, "series_24h": [], "levels": {"S":[],"R":[]}, "ts": _now_utc_str()}
 
-async def pair_change(a: str, b: str) -> float:
-    # approximate via 24h change
-    A = await price(a)
-    B = await price(b)
-    ca, cb = A.get("change_24h"), B.get("change_24h")
-    if isinstance(ca,(int,float)) and isinstance(cb,(int,float)):
-        return ca - cb
-    return 0.0
+        rows = k["result"]["list"]  # cada linha: [start, open, high, low, close, volume, turnover]
+        # Bybit devolve em ordem decrescente; vamos ordenar crescente por tempo
+        rows.sort(key=lambda r: int(r[0]))
+        series = [(int(r[0]), float(r[4])) for r in rows]
+        highs  = [float(r[2]) for r in rows]
+        lows   = [float(r[3]) for r in rows]
+        price  = series[-1][1] if series else None
+        hi24   = max(highs) if highs else None
+        lo24   = min(lows) if lows else None
+
+        # Níveis simples: pivot clássico a partir do último candle fechado
+        if rows:
+            o,h,l,c = map(float, rows[-1][1:5])
+            pp = (h + l + c) / 3.0
+            r1 = 2*pp - l
+            s1 = 2*pp - h
+            r2 = pp + (h - l)
+            s2 = pp - (h - l)
+            levels = {"S": [round(s1,2), round(s2,2)], "R": [round(r1,2), round(r2,2)]}
+        else:
+            levels = {"S": [], "R": []}
+
+        return {
+            "asset": asset,
+            "price": price,
+            "high": hi24,
+            "low": lo24,
+            "series_24h": series,
+            "levels": levels,
+            "ts": _now_utc_str(),
+        }
