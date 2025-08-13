@@ -1,77 +1,95 @@
-# app.py — StarkRadar Bot API
-# version: 0.18.3-stable
+
+"""
+StarkRadar Bot • v0.20-full
+- FastAPI + Telegram webhook
+- Commands: /start, /pulse, /eth, /btc
+- Resilient data layer with multi-source fetch + caching
+- Sparkline PNGs via matplotlib
+- Clean fallbacks (never empty messages)
+"""
 
 import os
+import asyncio
+from datetime import datetime, timezone
+from typing import Dict, Any
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from loguru import logger
-from services import tg  # pacote local
 
-APP_VERSION = "0.18.3-stable"
+from services import tg, markets
 
-app = FastAPI()
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
-BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
+APP_VERSION = "0.20-full"
+START_TS = datetime.now(timezone.utc)
 
-def _count_lines() -> int:
-    import os
-    total = 0
-    for d,_,fs in os.walk(os.getcwd()):
-        for f in fs:
-            if f.endswith((".py",".txt",".md",".env",".ini")):
-                try:
-                    with open(os.path.join(d,f),"rb") as h:
-                        total += sum(1 for _ in h)
-                except:
-                    pass
-    return total
+app = FastAPI(title="StarkRadar Bot", version=APP_VERSION)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")  # optional
+ENV = os.getenv("ENV", "prod")
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("ok")
+    return PlainTextResponse(f"StarkRadar Bot {APP_VERSION} is alive.")
 
 @app.get("/status")
 async def status():
-    return JSONResponse({"ok": True, "version": APP_VERSION, "linecount": _count_lines(), "last_error": None})
+    cache_stats = markets.cache_stats()
+    return JSONResponse({
+        "ok": True,
+        "version": APP_VERSION,
+        "uptime_s": int((datetime.now(timezone.utc) - START_TS).total_seconds()),
+        "cache": cache_stats
+    })
 
 @app.post("/webhook")
 async def webhook_root(request: Request):
-    if WEBHOOK_SECRET and request.headers.get("X-Webhook-Secret","") != WEBHOOK_SECRET:
-        return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
-
-    data = await request.json()
-    msg = data.get("message") or data.get("edited_message") or {}
-    chat = msg.get("chat") or {}
-    chat_id = chat.get("id")
-    text = (msg.get("text") or "").strip()
-    if not chat_id:
-        return {"ok": True}
-
-    cmd = (text.split()[0] if text else "").lower()
+    # Optional basic guard for Telegram secret token header (x-telegram-bot-api-secret-token)
+    if WEBHOOK_SECRET:
+        given = request.headers.get("x-telegram-bot-api-secret-token", "")
+        if given != WEBHOOK_SECRET:
+            return JSONResponse({"ok": False, "error": "bad secret"}, status_code=401)
 
     try:
-        if cmd == "/start":
-            await tg.send_start(BOT_TOKEN, chat_id)
-        elif cmd == "/pulse":
-            await tg.handle_pulse(BOT_TOKEN, chat_id)
-        elif cmd == "/eth":
-            await tg.handle_asset(BOT_TOKEN, chat_id, "ETH")
-        elif cmd == "/btc":
-            await tg.handle_asset(BOT_TOKEN, chat_id, "BTC")
-        elif cmd == "/strategy":
-            await tg.handle_strategy(BOT_TOKEN, chat_id)
-        else:
-            await tg.send_menu(BOT_TOKEN, chat_id)
-        return {"ok": True}
-    except Exception as e:
-        logger.exception("webhook error")
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        update = await request.json()
+    except Exception:
+        update = {}
 
-@app.on_event("startup")
-async def on_startup():
-    logger.info("startup complete")
+    chat_id = tg.extract_chat_id(update)
+    text = tg.extract_text(update)
+    logger.info(f"update from chat={chat_id} text={text!r}")
+
+    if not chat_id:
+        return JSONResponse({"ok": True})
+
+    cmd = (text or "").strip().lower()
+
+    # Route commands
+    if cmd in ("/start", "start"):
+        await tg.handle_start(BOT_TOKEN, chat_id)
+    elif cmd in ("/pulse", "pulse"):
+        await tg.handle_pulse(BOT_TOKEN, chat_id)
+    elif cmd in ("/eth", "eth"):
+        await tg.handle_asset(BOT_TOKEN, chat_id, "ETH")
+    elif cmd in ("/btc", "btc"):
+        await tg.handle_asset(BOT_TOKEN, chat_id, "BTC")
+    else:
+        await tg.send_markdown(
+            BOT_TOKEN, chat_id,
+            "Comandos: /pulse • /eth • /btc\n"
+            "_(digite um deles)_"
+        )
+
+    return JSONResponse({"ok": True})
+
+
+@app.get("/admin/ping/telegram")
+async def ping_telegram():
+    ok = await tg.test_send(BOT_TOKEN)
+    return JSONResponse({"ok": ok})
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    await markets.close()
     logger.info("shutdown complete")

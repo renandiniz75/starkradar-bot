@@ -1,24 +1,36 @@
-# starkradar v0.18-step2
 
-## Como usar
-1. Suba estes arquivos no GitHub/Render.
-2. Defina as variáveis de ambiente:
-   - `BOT_TOKEN` (obrigatório)
-   - `WEBHOOK_SECRET` (opcional, e use o mesmo header na configuração do webhook no Telegram/Render)
-3. Aponte o webhook do Telegram para `POST https://SEU_DOMINIO/webhook`.
+# StarkRadar Bot v0.20-full
 
-### Comandos
-- `/start` – boas-vindas e menu
-- `/pulse` – visão rápida (ETH, BTC, ETH/BTC)
-- `/eth` – detalhe do Ethereum
-- `/btc` – detalhe do Bitcoin
+Telegram bot com FastAPI e webhook. Comandos: `/start`, `/pulse`, `/eth`, `/btc`.
 
-### Observações
-- Usa CoinGecko (sem API key) para *spot, 24h high/low e série intraday*.
-- Evita Binance/Bybit para contornar 403/451.
-- Gráficos via Matplotlib (sparkline).
+## Como rodar local
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.sample .env  # edite BOT_TOKEN
+uvicorn app:app --reload --port 8080
+```
 
-### Roadmap rápido
-- Funding/Open Interest (Coinglass/Glassnode) – precisa de API keys.
-- Alertas e gatilhos automáticos.
-- Painéis com múltiplos tempos gráficos.
+## Render
+- Tipo: Web Service
+- Start Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+- Variáveis: `BOT_TOKEN`, `WEBHOOK_SECRET`(opcional), `COINGECKO_API_KEY`(opcional)
+
+Após deploy, configure o webhook:
+```
+curl -sS "https://api.telegram.org/bot$BOT_TOKEN/setWebhook" \
+  -d "url=https://SEUAPP.onrender.com/webhook" \
+  -d "secret_token=$WEBHOOK_SECRET"
+```
+
+## O que há de novo (v0.20)
+- Camada de mercado resiliente: CoinGecko (com chave opcional) + fallbacks Coinbase/Bitstamp
+- Séries de 24h via Bybit Kline (com tolerância a 403/timeout) e fallback sintético
+- Cache in-memory com TTL (evita 429/limites)
+- Sparkline PNG com matplotlib
+- Mensagens Markdown + menu estático
+
+## TODO próximos passos
+- Persistência em Postgres (Railway) para histórico e métricas
+- Funding/OI snapshots (derivados públicos) com backoff
+- Comando /panel com análise ampliada (risco, gatilhos)
