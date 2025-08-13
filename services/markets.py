@@ -1,174 +1,314 @@
-# v0.17.2-hotfixB • services/markets.py
-import math, statistics, datetime as dt, io, asyncio, random
-from typing import Dict, List, Tuple, Optional
+# services/markets.py
+# Coleta de dados com múltiplos fallbacks + cache TTL
+
+import time
+import math
+from typing import Dict, Any, List, Optional, Tuple
+
 import httpx
 from loguru import logger
-import matplotlib.pyplot as plt
+
+CACHE: Dict[str, Tuple[float, Any]] = {}
+TTL_SHORT = 30       # segundos (preços)
+TTL_MEDIUM = 90      # candles
+USER_AGENT = "StarkRadar/0.17 (+https://starkradar-bot)"
 
 HTTP_TIMEOUT = 8.0
-UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+client = httpx.AsyncClient(timeout=HTTP_TIMEOUT, headers={"User-Agent": USER_AGENT})
 
-ID_MAP = {"ETH": "ethereum", "BTC": "bitcoin"}
+# ----------------------------- utils cache ----------------------------- #
 
-# ---------------- HTTP helpers com retry ----------------
-
-async def _get_json(url: str, params: dict = None, headers: dict = None, retries: int = 2) -> dict:
-    headers = {"User-Agent": UA, **(headers or {})}
-    last_err = None
-    for i in range(retries + 1):
-        try:
-            timeout = httpx.Timeout(HTTP_TIMEOUT)
-            async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-                r = await client.get(url, params=params)
-                r.raise_for_status()
-                return r.json()
-        except Exception as e:
-            last_err = e
-            await asyncio.sleep(0.5 + 0.5 * i)  # backoff curto
-    logger.warning("GET fail {} params={} err={}", url, params, last_err)
-    return {}
-
-# ---------------- BYBIT (primário) ----------------
-
-async def bybit_ticker(symbol: str, category: str = "linear") -> Optional[float]:
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": category, "symbol": symbol}
-    try:
-        data = await _get_json(url, params)
-        lst = ((data or {}).get("result") or {}).get("list") or []
-        if not lst: return None
-        return float(lst[0]["lastPrice"])
-    except Exception as e:
-        logger.warning("bybit ticker fail: {}", e)
+def _cache_get(key: str, ttl: int) -> Optional[Any]:
+    now = time.time()
+    it = CACHE.get(key)
+    if not it:
         return None
+    ts, val = it
+    if now - ts <= ttl:
+        return val
+    return None
 
-async def bybit_kline_24h(symbol: str, category: str = "linear") -> Optional[List[Tuple[int,float]]]:
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": category, "symbol": symbol, "interval": "60", "limit": 24}
+def _cache_set(key: str, val: Any):
+    CACHE[key] = (time.time(), val)
+
+# ----------------------------- helpers ----------------------------- #
+
+def _pair(asset: str) -> str:
+    asset = asset.upper()
+    if asset not in ("ETH", "BTC"):
+        raise ValueError("asset inválido")
+    return f"{asset}USDT"
+
+def _pct(a: float, b: float) -> float:
+    if b == 0 or b is None or a is None:
+        return 0.0
+    return (a - b) / b * 100.0
+
+# ----------------------------- fontes ----------------------------- #
+
+async def _bybit_price(symbol: str) -> Optional[float]:
+    # Ticker último — Bybit
+    # Público, mas pode 403. Trate como opcional.
+    url = f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}"
     try:
-        data = await _get_json(url, params)
-        lst = ((data or {}).get("result") or {}).get("list") or []
-        if not lst: return None
-        series = []
-        for row in lst:
-            ts, close_ = int(row[0]), float(row[4])
-            series.append((ts, close_))
-        series.sort(key=lambda x: x[0])
-        return series
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        items = (data.get("result") or {}).get("list") or []
+        if items:
+            return float(items[0]["lastPrice"])
+    except Exception as e:
+        logger.warning("Bybit price fail: {}", e)
+    return None
+
+async def _kraken_price(asset: str) -> Optional[float]:
+    # Kraken: usa par USD (não USDT). Ajuste simples.
+    pair = "ETHUSD" if asset == "ETH" else "XBTUSD"
+    url = f"https://api.kraken.com/0/public/Ticker?pair={pair}"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        res = data.get("result") or {}
+        # chave dinâmica (ex: XETHZUSD ou XXBTZUSD)
+        key = next(iter(res.keys()))
+        return float(res[key]["c"][0])
+    except Exception as e:
+        logger.warning("Kraken price fail: {}", e)
+    return None
+
+async def _coinbase_price(asset: str) -> Optional[float]:
+    pair = f"{asset}-USD"
+    url = f"https://api.exchange.coinbase.com/products/{pair}/ticker"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        return float(data["price"])
+    except Exception as e:
+        logger.warning("Coinbase price fail: {}", e)
+    return None
+
+async def _coingecko_price(asset: str) -> Optional[float]:
+    ids = {"ETH": "ethereum", "BTC": "bitcoin"}[asset]
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        return float(data[ids]["usd"])
+    except Exception as e:
+        logger.warning("CoinGecko price fail: {}", e)
+    return None
+
+async def get_spot_price(asset: str) -> Optional[float]:
+    """
+    Preço spot com fallback agressivo.
+    """
+    cache_key = f"px:{asset}"
+    v = _cache_get(cache_key, TTL_SHORT)
+    if v is not None:
+        return v
+
+    symbol = _pair(asset)
+    for fn in (
+        lambda: _bybit_price(symbol),
+        lambda: _kraken_price(asset),
+        lambda: _coinbase_price(asset),
+        lambda: _coingecko_price(asset),
+    ):
+        px = await fn()
+        if px:
+            _cache_set(cache_key, px)
+            return px
+    return None
+
+# ---- candles 24h (lista de (ts_ms, open, high, low, close)) ---- #
+
+async def _bybit_candles(symbol: str, interval="60", limit=24) -> Optional[List[List[float]]]:
+    url = (
+        "https://api.bybit.com/v5/market/kline"
+        f"?category=linear&symbol={symbol}&interval={interval}&limit={limit}"
+    )
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        js = r.json()
+        rows = (js.get("result") or {}).get("list") or []
+        # Bybit retorna [start, open, high, low, close, volume, turnover]
+        rows = sorted(rows, key=lambda x: int(x[0]))
+        out = []
+        for it in rows:
+            out.append([
+                int(it[0]), float(it[1]), float(it[2]), float(it[3]), float(it[4])
+            ])
+        return out
     except Exception as e:
         logger.warning("bybit kline fail: {}", e)
-        return None
+    return None
 
-# ---------------- COINGECKO (fallback A) ----------------
-
-async def gecko_price(asset: str) -> Tuple[Optional[float], Optional[float]]:
-    cid = ID_MAP.get(asset)
-    if not cid: return (None, None)
-    url = "https://api.coingecko.com/api/v3/simple/price"
-    params = {"ids": cid, "vs_currencies": "usd", "include_24hr_change": "true"}
-    j = await _get_json(url, params)
-    val = j.get(cid) or {}
+async def _coinbase_candles(asset: str, granularity=3600, limit=24) -> Optional[List[List[float]]]:
+    # Coinbase retorna [[time, low, high, open, close, volume], ...]
+    pair = f"{asset}-USD"
+    url = f"https://api.exchange.coinbase.com/products/{pair}/candles?granularity={granularity}"
     try:
-        return (float(val.get("usd")) if val.get("usd") is not None else None,
-                float(val.get("usd_24h_change")) if val.get("usd_24h_change") is not None else None)
-    except:
-        return (None, None)
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        rows = sorted(data, key=lambda x: x[0])[-limit:]
+        out = []
+        for t, low, high, opn, cls, _vol in rows:
+            out.append([int(t)*1000, float(opn), float(high), float(low), float(cls)])
+        return out
+    except Exception as e:
+        logger.warning("coinbase candles fail: {}", e)
+    return None
 
-async def gecko_ohlc_24h(asset: str) -> Optional[List[Tuple[int,float]]]:
-    """OHLC oficial; pode rate‑limitar. Retorna close por candle."""
-    cid = ID_MAP.get(asset)
-    if not cid: return None
-    url = f"https://api.coingecko.com/api/v3/coins/{cid}/ohlc"
-    params = {"vs_currency": "usd", "days": 1}
-    j = await _get_json(url, params)
-    if not isinstance(j, list) or not j:
-        return None
-    series = [(int(row[0]), float(row[4])) for row in j if isinstance(row, list) and len(row) >= 5]
-    series.sort(key=lambda x: x[0])
-    # downsample ~24 pontos
-    if len(series) > 24:
-        step = max(1, len(series)//24)
-        series = series[::step]
-    return series
+async def _coingecko_candles(asset: str, days=1) -> Optional[List[List[float]]]:
+    # market_chart: prices [[ts_ms, price], ...] — reconstruímos OHLC aproximado em 1h
+    ids = {"ETH": "ethereum", "BTC": "bitcoin"}[asset]
+    url = f"https://api.coingecko.com/api/v3/coins/{ids}/market_chart?vs_currency=usd&days={days}"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+        prices = data.get("prices") or []
+        # bucketiza por hora
+        buckets: Dict[int, List[float]] = {}
+        for ts, px in prices:
+            h = (ts // 3600000) * 3600000
+            buckets.setdefault(h, []).append(px)
+        out = []
+        for h in sorted(buckets.keys())[-24:]:
+            arr = buckets[h]
+            opn = arr[0]; cls = arr[-1]; high = max(arr); low = min(arr)
+            out.append([h, opn, high, low, cls])
+        return out
+    except Exception as e:
+        logger.warning("coingecko candles fail: {}", e)
+    return None
 
-# ---------------- COINGECKO (fallback B) ----------------
+async def series_24h(asset: str) -> Optional[List[List[float]]]:
+    cache_key = f"kl:24h:{asset}"
+    v = _cache_get(cache_key, TTL_MEDIUM)
+    if v is not None:
+        return v
+    symbol = _pair(asset)
+    for fn in (
+        lambda: _bybit_candles(symbol, "60", 24),
+        lambda: _coinbase_candles(asset, 3600, 24),
+        lambda: _coingecko_candles(asset, 1),
+    ):
+        rows = await fn()
+        if rows:
+            _cache_set(cache_key, rows)
+            return rows
+    return None
 
-async def gecko_chart_close_24h(asset: str) -> Optional[List[Tuple[int,float]]]:
-    """Usa market_chart (prices) como 2º fallback; muito resiliente."""
-    cid = ID_MAP.get(asset)
-    if not cid: return None
-    url = f"https://api.coingecko.com/api/v3/coins/{cid}/market_chart"
-    params = {"vs_currency": "usd", "days": 1, "interval": "hourly"}
-    j = await _get_json(url, params)
-    prices = (j or {}).get("prices") or []
-    if not prices: return None
-    series = [(int(ts), float(px)) for ts, px in prices]
-    series.sort(key=lambda x: x[0])
-    return series
+# ---- funding & open interest (Bybit) ---- #
 
-# ---------------- Camada de domínio ----------------
+async def get_bybit_funding(symbol: str) -> Optional[float]:
+    url = f"https://api.bybit.com/v5/market/funding/history?category=linear&symbol={symbol}&limit=1"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        js = r.json()
+        lst = (js.get("result") or {}).get("list") or []
+        if lst:
+            return float(lst[0]["fundingRate"])
+    except Exception as e:
+        logger.warning("funding fail: {}", e)
+    return None
 
-async def series_24h(asset: str) -> List[Tuple[int, float]]:
-    sym = "ETHUSDT" if asset == "ETH" else "BTCUSDT"
-    # 1) Bybit
-    s = await bybit_kline_24h(sym, "linear")
-    # 2) Gecko OHLC
-    if not s:
-        s = await gecko_ohlc_24h(asset)
-    # 3) Gecko market_chart
-    if not s:
-        s = await gecko_chart_close_24h(asset)
-    return s or []
+async def get_bybit_oi(symbol: str) -> Optional[float]:
+    # Open interest notional (USD) – agregamos 5min último
+    url = f"https://api.bybit.com/v5/market/open-interest?category=linear&symbol={symbol}&interval=5min&limit=1"
+    try:
+        r = await client.get(url)
+        r.raise_for_status()
+        js = r.json()
+        lst = (js.get("result") or {}).get("list") or []
+        if lst:
+            return float(lst[0]["openInterestUsd"])
+    except Exception as e:
+        logger.warning("OI fail: {}", e)
+    return None
 
-def calc_levels(series: List[Tuple[int,float]]) -> Dict[str, float]:
-    if not series:
-        return {"low": None, "high": None, "s1": None, "s2": None, "r1": None, "r2": None}
-    prices = [p for _, p in series]
-    lo, hi = min(prices), max(prices)
-    q = sorted(prices)
-    n = len(q) - 1
-    def qidx(p): 
-        return q[min(n, max(0, int(p*n)))]
-    return {"low": lo, "high": hi, "s1": qidx(0.25), "s2": qidx(0.1), "r1": qidx(0.75), "r2": qidx(0.9)}
+# ---- snapshot consolidado ---- #
 
-async def price_24h(asset: str) -> Tuple[Optional[float], Optional[float]]:
-    sym = "ETHUSDT" if asset == "ETH" else "BTCUSDT"
-    px = await bybit_ticker(sym, "linear")
-    chg = None
-    if px is None:
-        px, chg = await gecko_price(asset)
-    else:
-        _, chg = await gecko_price(asset)  # só para % 24h
-    return (px, chg)
+async def snapshot(asset: str) -> Dict[str, Any]:
+    """
+    Retorna dicionário com:
+    price, chg24, high, low, open, close, series (closes),
+    funding, oi, rel (ETH/BTC), levels {S1,S2,R1,R2}, rsi, ma
+    """
+    asset = asset.upper()
+    px = await get_spot_price(asset)
+    candles = await series_24h(asset)
 
-async def snapshot(asset: str) -> Dict:
-    ser = await series_24h(asset)
-    lv = calc_levels(ser)
-    px, chg = await price_24h(asset)
-    ts = dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    # Se a série vier vazia, desenha flat com o próprio preço (evita gráfico em branco)
-    if not ser and px:
-        now_ms = int(dt.datetime.utcnow().timestamp()*1000)
-        ser = [(now_ms - 23*3600_000 + i*3600_000, float(px)) for i in range(24)]
-    return {"asset": asset, "price": px, "change_24h": chg, "series": ser, "levels": lv, "ts": ts}
+    open_, close_, high_, low_ = None, None, None, None
+    chg24 = None
+    series = []
 
-# ---------------- Render gráfico ----------------
+    if candles:
+        open_ = candles[0][1]
+        high_ = max(c[2] for c in candles)
+        low_  = min(c[3] for c in candles)
+        close_= candles[-1][4]
+        series = [c[4] for c in candles]
+        if open_ and close_:
+            chg24 = _pct(close_, open_)
 
-def spark_png(series: List[Tuple[int,float]], title: str) -> bytes:
-    fig = plt.figure(figsize=(6, 2.3), dpi=160)
-    ax = fig.add_subplot(111)
-    if series:
-        xs = [dt.datetime.utcfromtimestamp(ts/1000 if ts>1e12 else ts) for ts,_ in series]
-        ys = [y for _,y in series]
-        ax.plot(xs, ys, linewidth=2)
-        base = min(ys) * 0.995
-        ax.fill_between(xs, ys, base, alpha=0.12)
-    ax.set_title(title, fontsize=9)
-    ax.grid(True, alpha=0.25)
-    for spine in ["top","right"]:
-        ax.spines[spine].set_visible(False)
-    fig.autofmt_xdate(rotation=0)
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
-    plt.close(fig)
-    return buf.getvalue()
+    price = px or close_  # garante um preço
+
+    # Funding & OI (Bybit – se falhar, “None”)
+    symbol = _pair(asset)
+    funding = await get_bybit_funding(symbol)
+    oi = await get_bybit_oi(symbol)
+
+    # ETH/BTC relativo
+    rel = None
+    if asset in ("ETH", "BTC"):
+        pe = await get_spot_price("ETH")
+        pb = await get_spot_price("BTC")
+        if pe and pb:
+            rel = pe / pb
+
+    # S/R (pivots clássicos)
+    levels = {}
+    if high_ and low_ and close_:
+        P = (high_ + low_ + close_) / 3.0
+        R1 = 2*P - low_
+        S1 = 2*P - high_
+        R2 = P + (high_ - low_)
+        S2 = P - (high_ - low_)
+        levels = {"S1": S1, "S2": S2, "R1": R1, "R2": R2}
+
+    # RSI (14) e MAs simples (7, 21)
+    rsi = None
+    ma = {}
+    if len(series) >= 21:
+        deltas = [series[i] - series[i-1] for i in range(1, len(series))]
+        ups = [max(d, 0) for d in deltas]
+        downs = [abs(min(d, 0)) for d in deltas]
+        n = 14
+        avg_up = sum(ups[-n:]) / n
+        avg_dn = sum(downs[-n:]) / n
+        rs = (avg_up / avg_dn) if avg_dn != 0 else math.inf
+        rsi = 100 - (100 / (1 + rs))
+        ma["ma7"] = sum(series[-7:]) / 7
+        ma["ma21"] = sum(series[-21:]) / 21
+
+    return {
+        "asset": asset,
+        "price": price,
+        "chg24": chg24,
+        "open": open_, "close": close_, "high": high_, "low": low_,
+        "series": series,
+        "funding": funding,
+        "open_interest_usd": oi,
+        "rel_eth_btc": rel,
+        "levels": levels,
+        "rsi": rsi,
+        "ma": ma,
+    }
