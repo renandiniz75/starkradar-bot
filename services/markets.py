@@ -1,184 +1,201 @@
-# services/markets.py
-# Foco: fontes públicas com fallback + retry (Coinbase -> Kraken -> Bitstamp)
-import asyncio, time
-from typing import Dict, Any, List, Optional, Tuple
+
+import os
+import asyncio
+from datetime import datetime, timezone, timedelta
+from typing import Dict, Any, List, Tuple, Optional
+
+import aiohttp
 from loguru import logger
-import httpx
-from datetime import datetime, timezone
 
-HTTP_TIMEOUT = 8.0
-RETRIES = 2
-BACKOFF = 0.8
+# Simple in-memory cache
+_CACHE: Dict[str, Tuple[datetime, Any]] = {}
+_CACHE_TTL = int(os.getenv("CACHE_TTL_S", "30"))  # seconds
+_HTTP_TIMEOUT = aiohttp.ClientTimeout(total=15)
 
-# --------- Utils HTTP ---------
-async def _get_json(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None) -> Any:
-    params = params or {}
-    headers = headers or {"User-Agent": "StarkRadarBot/0.17"}
-    for attempt in range(RETRIES + 1):
+COINGECKO_API_KEY = os.getenv("COINGECKO_API_KEY", "")
+
+_session: Optional[aiohttp.ClientSession] = None
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def cache_stats() -> Dict[str, Any]:
+    return {
+        "entries": len(_CACHE),
+        "ttl_s": _CACHE_TTL
+    }
+
+async def _session_get() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        _session = aiohttp.ClientSession(timeout=_HTTP_TIMEOUT, trust_env=True)
+    return _session
+
+async def close():
+    global _session
+    if _session and not _session.closed:
+        await _session.close()
+
+def _cache_get(key: str):
+    data = _CACHE.get(key)
+    if not data:
+        return None
+    ts, val = data
+    if (_now() - ts).total_seconds() > _CACHE_TTL:
+        return None
+    return val
+
+def _cache_set(key: str, val: Any):
+    _CACHE[key] = (_now(), val)
+
+async def _get_json(url: str, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None) -> Any:
+    ses = await _session_get()
+    # Simple retry
+    for i in range(3):
         try:
-            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-                r = await client.get(url, params=params, headers=headers)
+            async with ses.get(url, params=params, headers=headers) as r:
                 r.raise_for_status()
-                return r.json()
+                return await r.json()
         except Exception as e:
-            if attempt < RETRIES:
-                await asyncio.sleep(BACKOFF * (attempt + 1))
-                continue
-            logger.warning("GET fail: %s %s", url, str(e))
-            raise
+            if i == 2:
+                logger.warning(f"GET fail: {url} {e}")
+                raise
+            await asyncio.sleep(0.5 * (i + 1))
 
-# --------- Sources ---------
-async def _coinbase_ticker(symbol: str) -> Optional[float]:
-    # symbol: "ETH-USD" | "BTC-USD"
-    url = f"https://api.exchange.coinbase.com/products/{symbol}/ticker"
+# ---------------- Sources ----------------
+
+async def price_from_coinbase(symbol: str) -> Optional[float]:
+    # symbol: "BTC" or "ETH"
     try:
-        data = await _get_json(url)
-        return float(data.get("price"))
+        data = await _get_json(f"https://api.coinbase.com/v2/prices/{symbol}-USD/spot")
+        return float(data["data"]["amount"])
     except Exception:
         return None
 
-async def _coinbase_candles(symbol: str, granularity: int = 3600, limit: int = 24) -> List[Tuple[int, float]]:
-    # returns [(ts_sec, close), ...] ascending
-    url = f"https://api.exchange.coinbase.com/products/{symbol}/candles"
-    params = {"granularity": granularity}
+async def price_from_bitstamp(symbol: str) -> Optional[float]:
+    pair = f"{symbol.lower()}usd"
     try:
-        data = await _get_json(url, params=params)
-        # Coinbase returns [[time, low, high, open, close, volume], ...] (time in seconds), DESC order
-        rows = sorted(data, key=lambda x: x[0])
-        if limit:
-            rows = rows[-limit:]
-        series = [(int(r[0]), float(r[4])) for r in rows]
-        return series
+        data = await _get_json(f"https://www.bitstamp.net/api/v2/ticker/{pair}")
+        return float(data["last"])
     except Exception:
+        return None
+
+async def price_from_coingecko_simple(symbols: List[str]) -> Dict[str, Any]:
+    # symbols in ["bitcoin","ethereum"]
+    params = {
+        "ids": ",".join(symbols),
+        "vs_currencies": "usd,btc",
+        "include_24hr_change": "true"
+    }
+    headers = {}
+    if COINGECKO_API_KEY:
+        headers["x-cg-pro-api-key"] = COINGECKO_API_KEY
+    try:
+        data = await _get_json("https://api.coingecko.com/api/v3/simple/price", params=params, headers=headers)
+        return data
+    except Exception:
+        return {}
+
+async def series_from_bybit(symbol: str) -> List[Tuple[int, float]]:
+    # symbol: "ETHUSDT" or "BTCUSDT", returns [(ts, price), ...] last 24 hours hourly
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": "60",
+        "limit": "24"
+    }
+    try:
+        data = await _get_json("https://api.bybit.com/v5/market/kline", params=params)
+        arr = data.get("result", {}).get("list", [])
+        out = []
+        for row in arr:
+            # bybit returns [startTime, open, high, low, close, volume, turnover]
+            ts_ms = int(row[0])
+            close = float(row[4])
+            out.append((ts_ms, close))
+        out.sort(key=lambda x: x[0])
+        return out
+    except Exception as e:
+        logger.warning("bybit kline failed: %s", e)
         return []
 
-async def _kraken_ticker(pair: str) -> Optional[float]:
-    # pair: "ETHUSD" | "BTCUSD"
-    url = "https://api.kraken.com/0/public/Ticker"
-    params = {"pair": pair}
-    try:
-        data = await _get_json(url, params=params)
-        result = data.get("result") or {}
-        key = next(iter(result.keys()), None)
-        if not key:
-            return None
-        last = result[key]["c"][0]
-        return float(last)
-    except Exception:
-        return None
+# ---------------- Public API ----------------
 
-async def _kraken_ohlc(pair: str, interval: int = 60) -> List[Tuple[int, float]]:
-    # returns ascending [(ts, close)]
-    url = "https://api.kraken.com/0/public/OHLC"
-    params = {"pair": pair, "interval": interval}
-    try:
-        data = await _get_json(url, params=params)
-        result = data.get("result") or {}
-        # ignore "last"
-        keys = [k for k in result.keys() if k != "last"]
-        if not keys:
-            return []
-        arr = result[keys[0]]
-        series = [(int(row[0]), float(row[4])) for row in arr][-24:]
-        return series
-    except Exception:
-        return []
+async def get_prices() -> Dict[str, Any]:
+    """Return dict with USD prices for BTC, ETH + 24h change and eth_btc ratio."""
+    key = "prices"
+    cached = _cache_get(key)
+    if cached:
+        return cached
 
-async def _bitstamp_ticker(symbol: str) -> Optional[float]:
-    # symbol: "ethusd" | "btcusd"
-    url = f"https://www.bitstamp.net/api/v2/ticker/{symbol}/"
-    try:
-        data = await _get_json(url)
-        return float(data.get("last"))
-    except Exception:
-        return None
+    # Try CoinGecko first (if not rate-limited), then fallbacks
+    cg = await price_from_coingecko_simple(["bitcoin", "ethereum"])
+    btc = cg.get("bitcoin", {}).get("usd")
+    eth = cg.get("ethereum", {}).get("usd")
+    btc_ch = cg.get("bitcoin", {}).get("usd_24h_change")
+    eth_ch = cg.get("ethereum", {}).get("usd_24h_change")
 
-async def _bitstamp_ohlc(symbol: str, step: int = 3600, limit: int = 24) -> List[Tuple[int, float]]:
-    url = f"https://www.bitstamp.net/api/v2/ohlc/{symbol}/"
-    params = {"step": step, "limit": limit}
-    try:
-        data = await _get_json(url, params=params)
-        data = (data or {}).get("data", {}).get("ohlc", [])
-        series = [(int(x["timestamp"]), float(x["close"])) for x in data]
-        return series
-    except Exception:
-        return []
+    if btc is None:
+        btc = await price_from_coinbase("BTC") or await price_from_bitstamp("BTC")
+    if eth is None:
+        eth = await price_from_coinbase("ETH") or await price_from_bitstamp("ETH")
 
-# --------- Public API ---------
-_SYMBOLS = {
-    "ETH": {"cb": "ETH-USD", "kr": "ETHUSD", "bs": "ethusd"},
-    "BTC": {"cb": "BTC-USD", "kr": "BTCUSD", "bs": "btcusd"},
-}
+    eth_btc = None
+    if eth and btc:
+        eth_btc = eth / btc
 
-async def price_now(asset: str) -> Optional[float]:
-    m = _SYMBOLS.get(asset.upper())
-    if not m:
-        return None
-    # Coinbase
-    px = await _coinbase_ticker(m["cb"])
-    if px is not None:
-        return px
-    # Kraken
-    px = await _kraken_ticker(m["kr"])
-    if px is not None:
-        return px
-    # Bitstamp
-    px = await _bitstamp_ticker(m["bs"])
-    return px
+    out = {
+        "btc": btc,
+        "eth": eth,
+        "btc_24h_change": btc_ch,
+        "eth_24h_change": eth_ch,
+        "eth_btc": eth_btc
+    }
+    _cache_set(key, out)
+    return out
 
 async def series_24h(asset: str) -> List[Tuple[int, float]]:
-    m = _SYMBOLS.get(asset.upper())
-    if not m: return []
-    series = await _coinbase_candles(m["cb"], 3600, 24)
-    if series: return series
-    series = await _kraken_ohlc(m["kr"], 60)
-    if series: return series
-    series = await _bitstamp_ohlc(m["bs"], 3600, 24)
-    return series or []
+    """Hourly series for last 24h. asset: 'BTC' or 'ETH'."""
+    key = f"series:{asset}"
+    cached = _cache_get(key)
+    if cached:
+        return cached
 
-def _hi_lo_change(series: List[Tuple[int,float]]) -> Dict[str, Optional[float]]:
-    if not series:
-        return {"high": None, "low": None, "change_24h": None}
-    closes = [p for _, p in series]
-    high = max(closes)
-    low = min(closes)
-    change = None
-    if len(closes) >= 2:
-        change = (closes[-1] / closes[0] - 1) * 100.0
-    return {"high": high, "low": low, "change_24h": change}
+    symbol = f"{asset}USDT"
+    data = await series_from_bybit(symbol)
 
-def _levels(closes: List[float]) -> Dict[str, str]:
-    if not closes:
-        return {"S": "- / -", "R": "- / -"}
-    last = closes[-1]
-    # níveis simples: % bands + extremos
-    s1 = min(last * 0.97, min(closes))
-    s2 = min(last * 0.95, sorted(closes)[max(0, int(len(closes)*0.1)-1)])
-    r1 = max(last * 1.03, max(closes))
-    r2 = max(last * 1.05, sorted(closes)[int(len(closes)*0.9)])
-    def fmt(x): 
-        try: return f"{x:,.2f}"
-        except: return "-"
-    return {"S": f"{fmt(s2)} / {fmt(s1)}", "R": f"{fmt(r1)} / {fmt(r2)}"}
+    # Fallback: build synthetic series with last price if needed
+    if not data:
+        prices = await get_prices()
+        last = prices.get(asset.lower())
+        if last:
+            now = int(_now().timestamp()) * 1000
+            data = [(now - i*3600_000, float(last)) for i in reversed(range(24))]
+
+    _cache_set(key, data)
+    return data
 
 async def snapshot(asset: str) -> Dict[str, Any]:
-    ser = await series_24h(asset)
-    px = await price_now(asset)
-    hlc = _hi_lo_change(ser)
-    closes = [p for _, p in ser]
-    lv = _levels(closes)
+    """Return current price, intraday high/low derived from series, simple levels."""
+    prices = await get_prices()
+    px = prices.get(asset.lower())
+    series = await series_24h(asset)
+
+    intraday_high = max([p for _, p in series], default=px or 0.0)
+    intraday_low = min([p for _, p in series], default=px or 0.0)
+
+    # Simple supports/resistances based on quartiles between low/high
+    s1 = intraday_low + (intraday_high - intraday_low) * 0.25
+    s2 = intraday_low
+    r1 = intraday_low + (intraday_high - intraday_low) * 0.75
+    r2 = intraday_high
+
     return {
         "asset": asset,
         "price": px,
-        "high_24h": hlc["high"],
-        "low_24h": hlc["low"],
-        "change_24h_pct": hlc["change_24h"],
-        "series_24h": ser,
-        "levels": lv,
-        "ts": int(time.time())
+        "series_24h": series,
+        "intraday_high": intraday_high,
+        "intraday_low": intraday_low,
+        "supports": [round(s2, 2), round(s1, 2)],
+        "resistances": [round(r1, 2), round(r2, 2)]
     }
-
-async def health_check() -> Dict[str, Any]:
-    ok_eth = await price_now("ETH") is not None
-    ok_btc = await price_now("BTC") is not None
-    return {"eth": ok_eth, "btc": ok_btc}
