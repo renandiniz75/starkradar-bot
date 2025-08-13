@@ -1,81 +1,76 @@
 # services/tg.py
-import io, datetime, asyncio, httpx
-from . import markets, rendering
+# v0.17.3 – Corrige formatação quando preço não veio, e manda gráfico se houver série.
 
-TG_API = "https://api.telegram.org/bot{token}/{method}"
+from __future__ import annotations
+from io import BytesIO
+from datetime import datetime, timezone
+from loguru import logger
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
-async def send_text(token: str, chat_id: int, text: str, parse_mode: str | None = None):
-    url = TG_API.format(token=token, method="sendMessage")
-    async with httpx.AsyncClient(timeout=20) as cli:
-        payload = {"chat_id": chat_id, "text": text}
-        if parse_mode:
-            payload["parse_mode"] = parse_mode
-        await cli.post(url, json=payload)
+from services.markets import series_24h
 
-async def send_photo(token: str, chat_id: int, caption: str, png_bytes: bytes):
-    url = TG_API.format(token=token, method="sendPhoto")
-    files = {"photo": ("spark.png", png_bytes, "image/png")}
-    data = {"chat_id": str(chat_id), "caption": caption}
-    async with httpx.AsyncClient(timeout=30) as cli:
-        await cli.post(url, data=data, files=files)
+def _fmt_price(px):
+    return "-" if px is None else f"{px:,.2f}"
 
-async def ping(token: str) -> bool:
-    url = TG_API.format(token=token, method="getMe")
-    async with httpx.AsyncClient(timeout=10) as cli:
-        r = await cli.get(url)
-        return r.json().get("ok", False)
+async def build_asset_text(asset: str) -> tuple[str, bytes | None]:
+    data = await series_24h(asset)
+    px, hi, lo = data["price"], data["high"], data["low"]
+    lev = data["levels"]; ts = data["ts"]
 
-def _fmt_usd(x):
-    try:
-        return f"${x:,.2f}"
-    except Exception:
-        return "-"
+    text = (
+        f"{asset} ${_fmt_price(px)}\n"
+        f"H: {_fmt_price(hi)} | L: {_fmt_price(lo)}\n"
+        f"Níveis S:{', '.join(map(str, lev.get('S', [])) or ['-'])} | "
+        f"R:{', '.join(map(str, lev.get('R', [])) or ['-'])}\n"
+        f"{ts}"
+    )
 
-def _levels_text(levels):
-    s = " / ".join(str(int(v)) for v in levels.get("supports", []))
-    r = " / ".join(str(int(v)) for v in levels.get("resistances", []))
-    return s or "-", r or "-"
+    # Sparkline PNG (se tiver série)
+    png_bytes = None
+    series = data.get("series_24h") or []
+    if series:
+        xs = [i for i,_ in enumerate(series)]
+        ys = [p for _,p in series]
+        fig = plt.figure(figsize=(6,2.2), dpi=150)
+        ax = fig.add_axes([0.06,0.2,0.9,0.7])
+        ax.plot(xs, ys, linewidth=2)
+        ax.set_xticks([]); ax.set_yticks([])
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['left'].set_visible(False)
+        ax.spines['bottom'].set_visible(False)
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        png_bytes = buf.getvalue()
 
-async def handle_start(token: str, chat_id: int):
-    spark = await markets.series_24h("ETH")
-    png = rendering.sparkline_png(spark.get("series", []), title="ETH 24h")
-    await send_photo(token, chat_id, "Bem-vindo! 👋\nUse /pulse, /eth, /btc, /panel.", png)
+    return text, png_bytes
 
-async def build_asset_text(asset: str) -> tuple[str, list[float]]:
-    snap = await markets.snapshot(asset)
-    px = snap.get("price")
-    lv = snap.get("levels", {})
-    s, r = _levels_text(lv)
-    now = datetime.datetime.utcnow().strftime("%H:%M UTC")
-    txt = f"{asset} {_fmt_usd(px)}\nNíveis S:{s} | R:{r}\n{now}"
-    return txt, (snap.get("series") or [])
+# Telegram helpers
+from os import getenv
+import httpx
 
-async def handle_asset(token: str, chat_id: int, asset: str):
-    txt, series = await build_asset_text(asset)
-    png = rendering.sparkline_png(series, title=f"{asset} 24h")
-    await send_photo(token, chat_id, txt, png)
+BOT_TOKEN = getenv("BOT_TOKEN")
+API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
-async def handle_pulse(token: str, chat_id: int):
-    eth = await markets.snapshot("ETH")
-    btc = await markets.snapshot("BTC")
-    # Relative performance
-    eth_chg = eth.get("change_24h")
-    btc_chg = btc.get("change_24h")
-    pair = await markets.pair_change("ETH","BTC")
+async def send_message(chat_id: int, text: str, reply_to: int | None=None):
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.post(f"{API}/sendMessage", json={
+            "chat_id": chat_id, "text": text, "parse_mode": "HTML",
+            **({"reply_parameters": {"message_id": reply_to}} if reply_to else {})
+        })
 
-    lines = [
-        f"Pulse 🕒 {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}",
-        f"ETH {_fmt_usd(eth.get('price'))} ({eth_chg:+.2f}% 24h)",
-        f"BTC {_fmt_usd(btc.get('price'))} ({btc_chg:+.2f}% 24h)",
-        f"ETH/BTC {pair:+.2f}% (24h)",
-        "",
-        "Análise: foco nos gatilhos de rompimento e gestão de risco em perdas de suporte. Use /eth ou /btc."
-    ]
-    await send_text(token, chat_id, "\n".join(lines))
+async def send_photo(chat_id: int, caption: str, png_bytes: bytes):
+    files = {"photo": ("chart.png", png_bytes, "image/png")}
+    data  = {"chat_id": chat_id, "caption": caption}
+    async with httpx.AsyncClient(timeout=20) as client:
+        await client.post(f"{API}/sendPhoto", data=data, files=files)
 
-async def handle_panel(token: str, chat_id: int):
-    # Simple panel: two sparklines in two messages to keep it robust
-    for asset in ("ETH","BTC"):
-        txt, series = await build_asset_text(asset)
-        png = rendering.sparkline_png(series, title=f"{asset} 24h")
-        await send_photo(token, chat_id, txt, png)
+async def handle_asset(chat_id: int, asset: str):
+    text, png = await build_asset_text(asset)
+    if png:
+        await send_photo(chat_id, text, png)
+    else:
+        await send_message(chat_id, text)
