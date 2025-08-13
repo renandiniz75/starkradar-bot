@@ -1,27 +1,29 @@
-# Stark Cripto Radar — v0.16-full
+# StarkRadar Bot 0.17.0-full
 
-Bot de Telegram com webhook em FastAPI + gráficos, análise e transcrição de áudio.
+## Endpoints
+- `/` health
+- `/status` status + linecount
+- `/webhook` Telegram webhook (POST from Telegram)
 
-## Comandos
-
-- `/start` — boas-vindas + instruções
-- `/pulse` — boletim com preços, variação, níveis e síntese de notícias (12h)
-- `/eth` — leitura rápida do ETH
-- `/btc` — leitura rápida do BTC
-- `/panel` — mini painel PNG (ETH, BTC e ETH/BTC)
-
-Suporte a **áudio**: envie uma mensagem de voz com a pergunta. Se `OPENAI_API_KEY` estiver configurada, o bot transcreve com Whisper e responde via GPT com foco em cripto.
-
-## Variáveis de ambiente
-
+## Environment
 ```
-BOT_TOKEN= # token do @BotFather
-WEBHOOK_URL= # https://seuapp.onrender.com/webhook
-OPENAI_API_KEY= # opcional (voz e /gpt)
-NEWS_FEEDS=https://www.theblock.co/rss;https://www.coindesk.com/arc/outboundfeeds/rss/?outputType=xml
+BOT_TOKEN=123:ABC
+TELEGRAM_SECRET=optional
+PORT=10000
+```
+Set webhook once:
+```
+curl -sS "https://api.telegram.org/bot$BOT_TOKEN/setWebhook?url=https://YOUR-RENDER-URL/webhook"
 ```
 
-## Deploy (Render)
+## Commands
+- `/start` – boas-vindas + sparkline ETH
+- `/pulse` – ETH/BTC resumo e análise curta
+- `/eth` – snapshot com níveis e sparkline
+- `/btc` – snapshot com níveis e sparkline
+- `/panel` – ETH e BTC em sequência
 
-- `requirements.txt` já inclui `uvicorn`.
-- Command: `uvicorn app:app --host 0.0.0.0 --port $PORT`
+## Notes
+- Versão e contagem de linhas **não** aparecem nos balões. Ver só em `/status`.
+- Preços via Bybit público com fallback CoinGecko. Klíne 24h via Bybit.
+- Sem dependência de `python-telegram-bot` para evitar conflitos; enviamos direto na API do Telegram.
