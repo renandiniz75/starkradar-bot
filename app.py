@@ -1,78 +1,111 @@
-# starkradar / v0.18-step2
-# FastAPI + Telegram webhook (no python-telegram-bot, pure HTTP)
-# ENV required: BOT_TOKEN, (optional) WEBHOOK_SECRET
-# Endpoints:
-#   GET  /status    -> service status
-#   POST /webhook   -> Telegram webhook
-#   GET  /admin/ping/telegram -> quick check for BOT_TOKEN presence
+# app.py — StarkRadar Bot API
+# version: 0.17.3-stable
+# lines-counted: will be computed at runtime via /status
 
-from fastapi import FastAPI, Request, HTTPException
+import os, io, asyncio, inspect
+from datetime import datetime, timezone
+from typing import Dict, Any
+
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
-import os, asyncio, inspect
+from loguru import logger
 
-from services import tg, markets, analysis, images
+from services import tg
+from services.markets import health_check as markets_health
 
-APP_VERSION = "v0.18-step2"
+APP_VERSION = "0.17.3-stable"
 
-app = FastAPI(title="starkradar-bot", version=APP_VERSION)
+app = FastAPI()
 
-@app.get("/status")
-async def status():
-    # Count lines in repo for quick sanity (non-critical)
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+BASE_URL = os.environ.get("BASE_URL", "").rstrip("/")
+
+if not BOT_TOKEN:
+    logger.warning("BOT_TOKEN ausente — configure no Render.")
+
+# ---------- Helpers ----------
+def _count_lines() -> int:
     try:
-        base = os.path.dirname(__file__)
+        root = os.getcwd()
         total = 0
-        for root, _, files in os.walk(base):
-            for fn in files:
-                if fn.endswith((".py", ".txt", ".md")):
-                    with open(os.path.join(root, fn), "r", encoding="utf-8", errors="ignore") as fh:
-                        total += sum(1 for _ in fh)
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                if fn.endswith((".py", ".txt", ".md", ".env")):
+                    with open(os.path.join(dirpath, fn), "rb") as f:
+                        total += sum(1 for _ in f)
+        return total
     except Exception:
-        total = -1
-
-    return {"ok": True, "version": APP_VERSION, "linecount": total, "last_error": None}
-
-@app.get("/admin/ping/telegram")
-async def ping_tg():
-    token = os.getenv("BOT_TOKEN")
-    return {"ok": bool(token), "has_token": bool(token)}
-
-@app.post("/webhook")
-async def webhook_root(request: Request):
-    # Optional shared secret header to avoid random posts
-    secret = os.getenv("WEBHOOK_SECRET")
-    if secret:
-        hdr = request.headers.get("X-Webhook-Secret")
-        if hdr != secret:
-            raise HTTPException(status_code=403, detail="Forbidden")
-
-    payload = await request.json()
-    try:
-        msg = payload.get("message") or payload.get("edited_message") or {}
-        chat_id = msg.get("chat", {}).get("id")
-        text = (msg.get("text") or "").strip()
-        if not chat_id:
-            return JSONResponse({"ok": True, "skipped": True})
-
-        # Commands
-        if text.lower().startswith("/start"):
-            await tg.reply_start(chat_id)
-        elif text.lower().startswith("/pulse"):
-            await tg.reply_pulse(chat_id)
-        elif text.lower().startswith("/eth"):
-            await tg.reply_asset(chat_id, "ETH")
-        elif text.lower().startswith("/btc"):
-            await tg.reply_asset(chat_id, "BTC")
-        else:
-            await tg.reply_help(chat_id)
-
-        return JSONResponse({"ok": True})
-    except Exception as e:
-        # Don't crash webhook, return OK to Telegram while logging
-        from loguru import logger
-        logger.exception("webhook error: {}", e)
-        return JSONResponse({"ok": True, "handled_error": str(e)})
+        return -1
 
 @app.get("/")
 async def root():
-    return PlainTextResponse("starkradar-bot is running. Use /status")
+    return PlainTextResponse("ok")
+
+@app.get("/status")
+async def status():
+    return JSONResponse({
+        "ok": True,
+        "version": APP_VERSION,
+        "linecount": _count_lines(),
+        "last_error": None
+    })
+
+# ---------- Telegram Webhook ----------
+@app.post("/webhook")
+async def webhook_root(request: Request):
+    # (Opcional) simples proteção de segredo via header
+    if WEBHOOK_SECRET:
+        sec = request.headers.get("X-Webhook-Secret", "")
+        if sec != WEBHOOK_SECRET:
+            return JSONResponse({"ok": False, "error": "forbidden"}, status_code=403)
+
+    data = await request.json()
+    try:
+        message = data.get("message") or data.get("edited_message") or {}
+        chat = (message.get("chat") or {})
+        chat_id = chat.get("id")
+        text = (message.get("text") or "").strip()
+
+        if not chat_id:
+            return JSONResponse({"ok": True})
+
+        cmd = (text or "").split()[0].lower()
+
+        # Comandos principais
+        if cmd == "/start":
+            await tg.send_start(BOT_TOKEN, chat_id)
+            return {"ok": True}
+
+        if cmd == "/pulse":
+            await tg.handle_pulse(BOT_TOKEN, chat_id)
+            return {"ok": True}
+
+        if cmd == "/eth":
+            await tg.handle_asset(BOT_TOKEN, chat_id, "ETH")
+            return {"ok": True}
+
+        if cmd == "/btc":
+            await tg.handle_asset(BOT_TOKEN, chat_id, "BTC")
+            return {"ok": True}
+
+        if cmd == "/strategy":
+            await tg.handle_strategy(BOT_TOKEN, chat_id)
+            return {"ok": True}
+
+        # fallback: eco curto com menu
+        await tg.send_menu(BOT_TOKEN, chat_id)
+        return {"ok": True}
+
+    except Exception as e:
+        logger.exception("webhook error")
+        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+
+# ---------- Lifecycle ----------
+@app.on_event("startup")
+async def on_startup():
+    logger.info("startup complete")
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    logger.info("shutdown complete")
